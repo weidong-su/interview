@@ -4,10 +4,13 @@
 
 lambda表达式的语法形式：
 [ capture ] ( params ) opt -> ret { body; };
+
 其中：
 capture表示捕获列表，params为参数列表，opt为函数类型，ret为返回值类型，body为函数体。
+
 由于C++11的返回值类型后置特性，可省略返回值类型，表示为：
 [ capture ] ( params ) opt { body; };
+
 下面对捕获列表做详细的说明：
 []：不捕获任何外部变量
 [=]：以复制的方式捕获外部作用域的所有变量，内部不可修改
