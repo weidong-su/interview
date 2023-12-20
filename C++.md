@@ -62,3 +62,11 @@ foo f(x, y);
 int c = f(1, 2);
 ```
 这里可以看出，按值捕获时，会把变量作为类的数据成员，且生成的operator()是const类型，因此无法对成员进行修改。如果想要在函数内修改值，需要设置函数类型为mutable。
+
+# C++ 11有哪些新特性
+
+# 讲一下程序的内存分区/内存模型？
+
+# move 了解吗？有什么作用？
+> https://www.cnblogs.com/S1mpleBug/p/16703328.html
+> https://zhuanlan.zhihu.com/p/580797507
