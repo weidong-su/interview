@@ -70,3 +70,42 @@ int c = f(1, 2);
 # move 了解吗？有什么作用？
 > https://www.cnblogs.com/S1mpleBug/p/16703328.html
 > https://zhuanlan.zhihu.com/p/580797507
+C++的move语义是一种高效的资源转移机制，允许我们把一个临时对象的资源“移动”到另一个对象，而不是复制整个对象。这种语义在处理大量数据或者动态分配的对象时，可以提高程序运行效率。
+
+## move的实现
+```
+template<typename _Tp>
+  constexpr typename std::remove_reference<_Tp>::type&&
+  move(_Tp&& __t) noexcept
+  { return static_cast<typename std::remove_reference<_Tp>::type&&>(__t); }
+```
+move的实现非常简单，就是对传入的万能引用 强制转换为右值引用。
+其中remove_reference的实现：
+```
+template <class T>
+    struct remove_reference
+    {
+        typedef T type;
+    };
+    template <class T>
+    struct remove_reference<T&>
+    {
+        typedef T type;
+    };
+    template <class T>
+    struct remove_reference<T&&>
+    {
+        typedef T type;
+    };
+```
+不管模版T被推导为type，type&, type&&，都可以提取出原本的type
+前面提到右值引用，下面说明一下左、右值引用：
+左值：表达式结束后仍存在的持久对象（代表一个在内存中占用确定位置的对象）
+右值：表达式结束后不再存在的临时对象（不在内存中占有确定位置的对象）
+左值引用：绑定在左值，对某个左值的引用，符号为&
+右值引用：绑定在临时对象，对某个右值的引用，符号为&&
+
+### 引用折叠
+一个模版函数的入参和实参 引用的绑定关系，可以分为
+T&-&：左值-左值
+T&-&&：左值-右值
