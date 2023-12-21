@@ -131,3 +131,5 @@ C++不允许出现引用的引用，因此当出现引用的引用时，会折�
 > https://zhuanlan.zhihu.com/p/369203981
 
 在STL中，随处可见这种问题。比如C++11引入的emplace_back，它接受左值也接受右值作为参数，接着，它转调用了空间配置器的construct函数，而construct又转调用了placement new，placement new根据参数是左值还是右值，决定调用拷贝构造函数还是移动构造函数。
+
+# 智能指针的原理、常用的智能指针及实现
