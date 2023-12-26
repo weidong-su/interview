@@ -150,3 +150,54 @@ C++ 中有四种智能指针：auto_pt、unique_ptr、shared_ptr、weak_ptr 其�
 weak_ptr用于解决shared_ptr循环引用时，引用计数无法降为0导致的内存泄漏问题。
 > https://blog.csdn.net/Xiejingfa/article/details/50772571
 ## shared_ptr实现
+> https://zhuanlan.zhihu.com/p/64543967
+```
+template<typename T>
+class sharedPtr {
+private:
+    T* _ptr;
+    int* _count;
+public:
+    // 构造函数
+    sharedPtr(T* ptr) : _ptr(ptr) {
+        _count = new int(1);
+    }
+    // 拷贝构造函数
+    sharedPtr(const sharedPtr& rhs): _ptr(rhs._ptr), _count(rhs._count){
+        *_count++;
+    }
+    // 赋值运算符
+    sharedPtr& operator= (const sharedPtr& rhs) {
+        if (this == &rhs) {
+            return *this;
+        }
+        reset(); // 减少左边引用计数
+        _ptr = rhs._ptr;
+        _count = rhs._count;
+        *_count++;
+        return *this;
+    }
+
+    // 析构函数
+    ~sharedPtr() {
+        reset();
+    }
+    // 获取原始指针
+    T* get() {
+        return _ptr;
+    }
+    // 获取引用计数
+    int count() {
+        return _count ? *_count ? 0;
+    }
+    void reset() {
+        if (_count) {
+            --*_count;
+            if (*_count == 0) {
+                delete _ptr;
+                delete _count;
+            }
+        }
+    }
+};
+```
