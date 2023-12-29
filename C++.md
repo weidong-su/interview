@@ -214,3 +214,35 @@ public:
 
 # C++的多态是如何实现的？
 > https://byteage.com/59.html
+> https://zhuanlan.zhihu.com/p/359466948
+C++支持两种多态性：编译时多态性、运行时多态性
++ 编译时多态性（静态多态）：通过重载函数实现，在编译期确定
++ 运行时多态性（动态多态）：通过虚函数实现，在运行时才确定
+C++函数重载是基于编译器的name mangling机制。
+编译器需要为C++中所有的函数，在符号表中生成唯一的标识符，来区分不同的函数。对于同名不同参的函数，编译器在进行name mangling操作时，通过函数名和参数类型，生成唯一的标识符，来支持函数重载。
+注意：name mangling 后得到的函数标识符与返回值类型是无关的，因此函数重载与返回值类型无关。
+比如，下面的几个同名的重载函数：
+```
+int func(int a) {
+    return a;
+}
+double func(double b) {
+    return b;
+}
+float func(float c) {
+    return c;
+}
+```
+在经过编译的name mangling操作后，得到的符号表中与func有关的：
+```
+
+main.o: file format mach-o 64-bit x86-64
+
+SYMBOL TABLE:
+0000000100003f80 g     F __TEXT,__text __Z4funcd
+0000000100003f90 g     F __TEXT,__text __Z4funcf
+0000000100003f70 g     F __TEXT,__text __Z4funci
+0000000100000000 g     F __TEXT,__text __mh_execute_header
+0000000100003fa0 g     F __TEXT,__text _main
+0000000000000000         *UND* dyld_stub_binder
+```
