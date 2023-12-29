@@ -235,6 +235,11 @@ float func(float c) {
 ```
 在经过编译的name mangling操作后，得到的符号表中与func有关的：
 ```
+g++ main.cc -o main.o && objdump -t main.o
+```
+
+
+```
 
 main.o: file format mach-o 64-bit x86-64
 
