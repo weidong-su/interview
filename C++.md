@@ -215,9 +215,13 @@ public:
 # C++的多态是如何实现的？
 > https://byteage.com/59.html
 > https://zhuanlan.zhihu.com/p/359466948
+> https://zhuanlan.zhihu.com/p/596288935
 C++支持两种多态性：编译时多态性、运行时多态性
-+ 编译时多态性（静态多态）：通过重载函数实现，在编译期确定
++ 编译时多态性（静态多态）：通过重载函数、模版实现，在编译期确定
 + 运行时多态性（动态多态）：通过虚函数实现，在运行时才确定
+
+## 静态多态
+重载 允许多个同名函数，而这些函数的参数列表不同，具体的参数类型，在编译期就能确认。
 C++函数重载是基于编译器的name mangling机制。
 编译器需要为C++中所有的函数，在符号表中生成唯一的标识符，来区分不同的函数。对于同名不同参的函数，编译器在进行name mangling操作时，通过函数名和参数类型，生成唯一的标识符，来支持函数重载。
 注意：name mangling 后得到的函数标识符与返回值类型是无关的，因此函数重载与返回值类型无关。
@@ -238,11 +242,8 @@ float func(float c) {
 g++ main.cc -o main.o && objdump -t main.o
 ```
 
-
 ```
-
 main.o: file format mach-o 64-bit x86-64
-
 SYMBOL TABLE:
 0000000100003f80 g     F __TEXT,__text __Z4funcd
 0000000100003f90 g     F __TEXT,__text __Z4funcf
@@ -251,3 +252,55 @@ SYMBOL TABLE:
 0000000100003fa0 g     F __TEXT,__text _main
 0000000000000000         *UND* dyld_stub_binder
 ```
+其中，__Z是GCC的规定，4是函数名func的长度，d是函数参数double，f是函数参数float类型，i是函数参数int类型。经过name mangling后可以发现，函数重载与函数返回值类型无关，只与函数名和函数参数类型有关。
+
+## 动态多态
+- 动态：在编译期无法确认调用的是基类还是派生类的虚成员函数**vf**，需要等待执行期才能确定。而将vf设置为虚成员函数，只需要在vf的声明前，加上virtual关键字。
+- 多态：由基类指针，调用基类和派生类的虚成员函数。
+编译器如何实现动态多态？
+编译器会为每个存在虚函数的类对象的内存中插入一个虚函数表指针（Virutal Function Pointer，vtpr），指向虚函数表(Virutal Function Table，vtbl)。虚表就是一个数组，槽位包含类的type_info，虚函数的地址。
+动态多态是通过vtpr、vtbl实现的。下面我们进一步讨论下，动态多态从编译到运行，哪些任务是在编译期完成，哪些任务是在执行期决议的。
+比如：
+```
+class Base {
+public:
+  Base() = default;
+  virtual 
+  void print()       { std::cout <<"Actual Type:  Base" << std::endl; }
+  void PointerType() { std::cout <<"Pointer Type: Base" << std::endl;}
+  virtual ~Base()    { std::cout <<"base-dtor"<< std::endl;}
+};
+
+class Derived : public Base{
+public:
+  Derived() = default;
+  void print()       { std::cout <<"Actual Type:  Derived" << std::endl; }
+  void PointerType() { std::cout <<"Pointer Type: Derived" << std::endl;}
+  ~Derived()         { std::cout <<"derived-dtor ";}
+private:
+   int random_{0};
+};
+
+int main(int argc, char const *argv[]) {
+  Base* base = new Derived;  // base指向子类对象
+  base->print();
+  base->PointerType();
+  delete base;
+  return 0;
+}
+```
+上面的代码中
+```
+Base* base = new Derived;  // base指向子类对象
+base->print();
+```
+base->print()会被编译器大致转换为：
+```
+(*base->vtpr[1])(base)
+```
+编译期确认：
+虚表的索引1是在编译期就能确认。即在编译期就能确定调用虚函数`print`在`vtpr`的位置，从而取出`print`的地址。而这个索引是按按照声明的顺序确认的，并且首位索引0是指向type_info，print是第一个声明的，那么其索引就是1。
+执行期确认：
+真正在执行时才能确认base指向的是基类对象还是派生类对象，从而确认不同的虚表，取出不同的虚函数。
+By the way, 第二个base代表的是this指针
+由于编译器对类的成员函数进行name mangling操作后将成员函数转换为非成员函数，会在参数列表首位安插一个this指针。
