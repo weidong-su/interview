@@ -380,3 +380,8 @@ Singleton &Singleton::GetInstance() {
 一般分为五个区域：栈区、堆区、函数区（存放函数体等二进制代码）、全局静态区、常量区
 
 C++中虚函数表位于只读数据段（.rodata），也就是C++内存模型中的常量区；而虚函数则位于代码段（.text），也就是C++内存模型中的代码区。
+
+# push_back和emplace_back的区别？
+> https://zhuanlan.zhihu.com/p/213853588
+> https://zhuanlan.zhihu.com/p/183861524
+
