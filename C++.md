@@ -385,5 +385,6 @@ C++中虚函数表位于只读数据段（.rodata），也就是C++内存模型�
 > https://zhuanlan.zhihu.com/p/213853588
 > https://zhuanlan.zhihu.com/p/183861524
 > https://wenfh2020.com/2023/08/01/cpp-emplace-back/
+> https://zhuanlan.zhihu.com/p/260508149
 > https://blog.csdn.net/LIJIWEI0611/article/details/122014506
 
