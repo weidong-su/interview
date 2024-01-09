@@ -1,5 +1,6 @@
 # 说一说你了解的关于lambda函数的全部知识
 > https://c.biancheng.net/view/3741.html
+
 > https://zhuanlan.zhihu.com/p/384314474
 
 lambda表达式的语法形式：
