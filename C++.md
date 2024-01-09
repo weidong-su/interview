@@ -383,8 +383,118 @@ C++中虚函数表位于只读数据段（.rodata），也就是C++内存模型�
 
 # push_back和emplace_back的区别？
 > https://zhuanlan.zhihu.com/p/213853588
+
 > https://zhuanlan.zhihu.com/p/183861524
+
++ 性能（开销更小）：
+  + push_back会先调用构造函数来创建一个临时对象，再通过拷贝构造函数临时对象将这个临时对象放入容器中，最后销毁临时对象。
+  + emplace_back仅会在容器中就地构造一个新对象减少临时对象拷贝、销毁的步骤，所以性能更高
++ 插入类的构造函数有多个参数时，push_back只能插入对象，emplace_back可以仅插入参数
+
+## emplace_back/push_back源码剖析
 > https://wenfh2020.com/2023/08/01/cpp-emplace-back/
+
 > https://zhuanlan.zhihu.com/p/260508149
+
 > https://blog.csdn.net/LIJIWEI0611/article/details/122014506
 
+[emplace_back源码](https://gcc.gnu.org/onlinedocs/gcc-5.4.0/libstdc++/api/a01685_source.html#l00087) 
++ emplace_back的入参__args是**万能引用** ，入参__args**完美转发**给内部的::new进行对象的创建和就地构造，并将其追加到数组对应的位置。
+```
+/* /usr/include/c++/4.8.2/debug/vector */
+template <typename _Tp, typename _Allocator = std::allocator<_Tp> >
+class vector : public _GLIBCXX_STD_C::vector<_Tp, _Allocator>,
+               public __gnu_debug::_Safe_sequence<vector<_Tp, _Allocator> > {
+    ...
+    // emplace_back 参数是万能引用。
+    template <typename... _Args>
+    void emplace_back(_Args&&... __args) {
+        ...
+        // 完美转发传递参数。
+        _Base::emplace_back(std::forward<_Args>(__args)...);
+        ...
+    }
+#endif
+    ...
+};
+```
++ allocator的construct进一步将参数完美转发给::new
+```
+/* /usr/include/c++/4.8.2/bits/vector.tcc */
+#if __cplusplus >= 201103L
+template <typename _Tp, typename _Alloc>
+template <typename... _Args>
+void vector<_Tp, _Alloc>::emplace_back(_Args&&... __args) {
+    if (this->_M_impl._M_finish != this->_M_impl._M_end_of_storage) {
+        _Alloc_traits::construct(this->_M_impl, this->_M_impl._M_finish,
+                                 std::forward<_Args>(__args)...);
+        ++this->_M_impl._M_finish;
+    } else {
+        _M_emplace_back_aux(std::forward<_Args>(__args)...);
+    }
+}
+#endif
+
+template <typename _Tp, typename... _Args>
+static auto construct(_Alloc& __a, _Tp* __p, _Args&&... __args)
+    -> decltype(_S_construct(__a, __p, std::forward<_Args>(__args)...)) {
+    _S_construct(__a, __p, std::forward<_Args>(__args)...);
+}
+
+/* /usr/include/c++/4.8.2/ext/new_allocator.h */
+template <typename _Tp>
+class new_allocator {
+#if __cplusplus >= 201103L
+    template <typename _Up, typename... _Args>
+    void construct(_Up* __p, _Args&&... __args) {
+        // 新建构造对象，并通过完美转发给对象传递对应的参数。
+        ::new ((void*)__p) _Up(std::forward<_Args>(__args)...);
+    }
+#endif
+};
+```
+比如 `datas.emplace_back("ee")` 插入的参数是字符串常量引用（右值引用），它插入对象元素，并没有触发拷贝构造和移动构造。因为 emplace_back 接口传递的是字符串常量引用，而真正的对象创建和构造是在 std::vector 内部实现的：`::new ((void*)__p) _Up(std::forward<_Args>(__args)...)` ;，相当于 `new Data("ee")` ，在插入对象元素的整个过程中，并未产生须要拷贝和移动的 临时对象。
+
+[push_back源码](https://link.zhihu.com/?target=https%3A//gcc.gnu.org/onlinedocs/gcc-5.4.0/libstdc%2B%2B/api/a01609_source.html%23l00913) 
+```
+void push_back(const value_type &__x) {
+    if (this->_M_impl._M_finish != this->_M_impl._M_end_of_storage) {
+        // 首先判断容器满没满，如果没满那么就构造新的元素，然后插入新的元素
+        _Alloc_traits::construct(this->_M_impl, this->_M_impl._M_finish,
+                                 __x);
+        ++this->_M_impl._M_finish; // 更新当前容器内元素数量
+    } else
+        // 如果满了，那么就重新申请空间，然后拷贝数据，接着插入新数据 __x
+        _M_realloc_insert(end(), __x);
+}
+
+// 如果 C++ 版本为 C++11 及以上（也就是从 C++11 开始新加了这个方法），使用 emplace_back() 代替
+#if __cplusplus >= 201103L
+void push_back(value_type &&__x) {
+    emplace_back(std::move(__x));
+}
+#endif
+```
+
+emplace_back() 和 push_back() 中区别最大的程序拎出来看：
+```
+_Alloc_traits::construct(this->_M_impl, this->_M_impl._M_finish,
+                                 std::forward<_Args>(__args)...); // emplace_back()
+_Alloc_traits::construct(this->_M_impl, this->_M_impl._M_finish,
+                                 __x);                            // push_back()
+```
+参考https://zhuanlan.zhihu.com/p/183861524
++ 插入构造参数时
+```
+std::vector<A> a;
+a.emplace_back(1);  
+emplace_back会将参数1完美转发给construct，construct再完美转发给new，即new (finish) A(1)，仅调用A的构造函数
+
+a.push_back(2);
+push_back：
+  1) 调用 有参构造函数 A (int x_arg) 创建临时对象；
+  2）调用 移动构造函数 A (A &&rhs)   到vector中；
+  3) 调用     析构函数               销毁临时对象；
+
++ 插入临时对象时，两者一样会调用移动构造函数
++ 插入对象实例时，两者一样会调用拷贝构造函数
