@@ -560,4 +560,74 @@ deduce(tmp);
 
 # 创建三个线程，依次打印1到100
 > https://developer.aliyun.com/article/1273406
->
+> 
+> https://zhuanlan.zhihu.com/p/512969481
+
+## 使用互斥锁
+```
+#include <iostream>
+#include <atomic>
+#include <thread>  
+#include <mutex>
+
+using namespace std;
+static int counter = 0;
+static mutex mtx;
+
+void print_num(int thread_id) {
+    while (counter < 10) {
+        //unique_lock<mutex> ul(mtx);
+        mtx.lock();
+        if (counter % 3 == thread_id) {
+            cout << "counter: " << counter << " thread_id: " << thread_id << endl;
+            counter++;
+        }
+        mtx.unlock();
+    }
+}
+
+int main() {
+    std::thread t1(print_num, 0);
+    std::thread t2(print_num, 1);
+    std::thread t3(print_num, 2);
+    t1.join();
+    t2.join();
+    t3.join();
+    return 0;
+}
+```
+
+## 使用信号量
+```
+#include <iostream>
+#include <atomic>
+#include <thread>  
+#include <mutex>
+#include <semaphore.h> 
+
+using namespace std;
+static int counter = 0;
+//static mutex mtx;
+static sem_t semaphore; // 定义信号量  
+
+void print_num(int thread_id) {
+    while (counter < 10) {
+        sem_wait(&semaphore); // 信号量-1
+        if (counter % 3 == thread_id) {
+            cout << "counter: " << counter << " thread_id: " << thread_id << endl;
+            counter++;
+        }
+        sem_post(&semaphore); // 信号量+1
+    }
+}
+
+int main() {
+    std::thread t1(print_num, 0);
+    std::thread t2(print_num, 1);
+    std::thread t3(print_num, 2);
+    t1.join();
+    t2.join();
+    t3.join();
+    return 0;
+}
+```
