@@ -915,7 +915,43 @@ vector内部有三个int*指针start、finish、end_of_storage，start和finish�
 4. 拷贝原数组的值到新的内存空间，在新尾部new_finish构造元素
 5. 调用析构函数destroy析构原来的对象
 6. 调用deallocate释放原来的空间
+`pop_back` 操作：
+1. finish前移
+2. 调用destroy析构掉finish位置的元素
+`erase` 范围操作：
+1. 调用copy将[last,finish)之间的元素拷贝到first处，返回new_finish
+2. 调用destroy析构掉[new_finish, finish)中间的元素
+3. 调整finish(finish - last + first)
+
+`erase` 单个位置操作：
+1. 调用copy将[pos + 1,finish)之间的元素拷贝到pos处
+2. 调整finish - 1
+3. 调用destroy析构掉finish位置的元素
 
 扩容操作：当vector需要添加新元素但当前空间不足时，它会进行扩容。扩容策略通常是以原来的1.5倍或者2倍进行扩容，这样可以保证在平均情况下每次需要扩容的次数是最少的，从而减少了整体的内存开销。在扩容的同时，vector会重新分配内存，把原来的数据拷贝到新的内存空间中，并释放原来的内存空间，以避免内存浪费。
 
 删除操作：vector中的元素可以通过多种方式删除，例如使用成员函数erase()或pop_back()等。这些操作会移除指定的元素并可能重新调整剩余元素的位置。
+
+# Vector的resize和reserve有什么区别
+> https://blog.csdn.net/JMW1407/article/details/108785448
+1. resize(int n, T val = T()):
++ 当n小于当前容器的size时，则将将元素减少到前n个（调用析构函数析构多余的元素）；
++ 当n大于当前容器的size时，则在容器尾部finish追加元素，若val制定了，则追加val元素的拷贝，否则调用元素的默认构造函数；
++ 当n大于当前容器的capacity，内存会重新分配；
+
+2. reserve(int n):
++ 当n大于当前容器的capacity，内存会重新分配，使capacity达到n；
++ 其他任何情况下内存都不会重新分配，且容器的capacity不变；
++ 不影响容器的size，也不会改变任何元素；
+
+总结来说，以下几点：
+1. vector的reserve增加了vector的capacity,但是它的size没有改变！而resize改变了vector的capacity同时也增加了它的size!
+   
+2. reserve是容器预留空间，但在空间内不真正创建元素对象，所以在没有添加新的对象之前，不能引用容器内的元素。加入新的元
+素时，要调用push_back/insert函数。
+
+3. rize是改变容器的大小，且会创建对象，因此，调用这个函数之后，就可以引用容器内的对象了，当加入新的元素时，用
+operator[]操作符，或者用迭代器来引用元素对象。此时再调用push_back()函数，是加在这个新的空间后面的。
+
+4. 两个函数的参数形式也有区别的，reserve函数只有一个参数，即需要预留的容器的空间；resize函数可以有两个参数，第一个参
+数是容器新的大小，第二个参数是要加入容器中的新元素，如果这个参数被省略，那么就调用元素对象的默认构造函数。
