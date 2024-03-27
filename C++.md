@@ -955,3 +955,90 @@ operator[]操作符，或者用迭代器来引用元素对象。此时再调用p
 
 4. 两个函数的参数形式也有区别的，reserve函数只有一个参数，即需要预留的容器的空间；resize函数可以有两个参数，第一个参
 数是容器新的大小，第二个参数是要加入容器中的新元素，如果这个参数被省略，那么就调用元素对象的默认构造函数。
+
+
+# STL中unordered_map和map的区别和应用场景，set、unordered_set
+
+>  https://zhuanlan.zhihu.com/p/439650164
+
+### hashtable实现
+`hashtable` 内部包含了3个函数指针hash（哈希函数），equals（判断key是否相同函数），get_key（从value获取key的方法），一个vector（所有的哈希桶所在），一个size_t 表示哈希表元素的数量，三个方法（函数或者仿函数）的大小是3。vector里有三个指针，大小是12。size_type大小是4。总大小为19，为了对齐系统会调整为20。
+哈希表节点是链表节点的结构，包含了一个next指针和value
+```
+template <class Value>
+struct _hashtable_node{
+    _hashtable_node* next;
+    Value val;
+}
+```
+
+### 解决碰撞
+解决哈希冲突的方法有：
+1.线性探测
+
+当使用hash function计算出位置后发现该位置已经没有空间时，会继续向下一一寻找可以放入元素的位置。如果到达尾部就再从头开始。
+
+这个方法简单易懂，但也有一个很直观的问题：在很多空位都被占用后，就会出现一个新元素疯狂撞墙最后才插入成功的现象，增加了平均插入成本。
+
+2.二次探测
+
+二次探测说的是，既然一个一个的探测会出现问题，那么就以二次方的形式探测。原来是h+1,h+2...现在就变为h+（1的平方），h+（2的平方）...
+
+很明显这样的探测法跳跃起来了，不会出现连续撞墙的现象，效果会好很多。但还是会出现在两个元素计算出的位置相同时，探测位置也相同而产生的效率浪费。
+
+3.开链
+
+开链是指在表格中单独维护一个list，让计算位置相同的元素形成一个链。这也是SGI STL中hash table的实现方法。
+
+### 开链在hashtable中的运用
+当元素的个数大于buckets的空间个数时，就会把buckets成2倍扩增，然后再调整为质数。这样重新计算后可以很好地把长链变短。
+其实再STL中这些数是规定好的，我们可以看一下。
+```
+static const int _stl_num_primes=28;
+static const unsigned long _stl_prime_list[_stl_num_primes]={
+    53,97,193,389,769,1543,3079,6151,12289,24593,1572869,3145739,6291469...
+}
+```
+比如第一次初始化时哈希表的buckets为53，当插入第54个元素会发生resize，将buckets增大为97
+
+### hash function
+
+我们都知道计算过程与是一个取模过程，但是也会有一些不同。比如遇到字符和字符串这种类型就不能进行单纯的计算了。
+
+在STL包装了一个函数bkt_num()，在此函数中调用hash function。
+```
+size_type bkt_num_key(const key_type& key,size_t n)const
+{
+    return hash(key)%n;
+}
+```
+针对char、int、long这些整数型别，hash functions 什么都没有做，就是原样返回。对于字符串，其偏特化哈希函数如下：
+```
+inline size_t _stl_hash_string(const char* s){
+    unsigned long h=0;
+    for(;*s;++s){
+        h=5*h+*s;
+        return size_t(h);
+    }
+}
+```
+
+### 插入操作insert与表格重整resize
+插入操作分为不允许重复`insert_unique` 和允许重复值`insert_equal` 
+具体来说，首先会调用`resize(num_elems + 1)`  判断是否需要重建表格，若需要，将表格大小扩大到下一个质数，并将所有节点重新哈希一遍，落到表格中。
+再调用`insert_unique_noresize` 插入，用哈希函数计算出桶号，先看下桶内是否有重复元素，重复了就返回false（允许重复的话就直接插入），然后再安插到桶内链表头
+
+STL中的unordered_map和map以及set和unordered_set都是关联容器，但它们之间的主要区别在于内部实现方式和性能特点。
+
+unordered_map和unordered_set基于哈希表（Hash Table）实现，使用哈希函数将元素映射到桶（Bucket）中。这种实现方式使得元素的插入、删除和查找操作的平均时间复杂度为O(1)，但在最坏情况下可能达到O(n)。哈希表不保证元素的顺序，因此unordered_map和unordered_set中的元素顺序是随机的。由于不需要维护元素的顺序，unordered_map和unordered_set的存储空间开销相对较小。
+
+相比之下，map和set基于红黑树（RB-Tree）实现，可以自动将元素按照键值排序。因此，元素的插入、删除和查找操作的时间复杂度均为O(log n)。由于需要维护元素的顺序，map和set的存储空间开销相对较大。同时，由于红黑树的特性，map和set中的元素是按照键值顺序排列的。
+
+在应用场景上，unordered_map和unordered_set适用于那些对查找性能要求较高，而不太关心元素顺序的场合。例如，如果你需要在一堆数据中快速查找某个键对应的值，或者需要计算元素出现的频率，那么unordered_map和unordered_set是很好的选择。
+
+而map和set则更适用于那些需要元素有序性的场合。例如，如果你需要根据键值的顺序对元素进行排序，或者需要利用元素的顺序进行某些操作，那么应该选择map和set。
+
+
+# select/poll/epoll的区别
+> https://xiaolincoding.com/os/8_network_system/selete_poll_epoll.html#%E6%9C%80%E5%9F%BA%E6%9C%AC%E7%9A%84-socket-%E6%A8%A1%E5%9E%8B
+
