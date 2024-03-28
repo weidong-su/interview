@@ -1042,3 +1042,127 @@ unordered_map和unordered_set基于哈希表（Hash Table）实现，使用哈�
 # select/poll/epoll的区别
 > https://xiaolincoding.com/os/8_network_system/selete_poll_epoll.html#%E6%9C%80%E5%9F%BA%E6%9C%AC%E7%9A%84-socket-%E6%A8%A1%E5%9E%8B
 
+## select 的用法
+```
+fd_set readfds, tmpfds;
+FD_ZERO(&readfds);  
+FD_SET(STDIN_FILENO, &readfds); // 监视标准输入
+while (1) {
+tmpfds = readfds; // select前先拷贝，由于select会修改fds
+retval = select(maxfd + 1, &tmpfds, NULL, NULL, &tv);
+if (retval) {  
+// select返回大于0，表示有文件描述符就绪  
+if (FD_ISSET(STDIN_FILENO, &tmpfds)) {  
+    // 标准输入可读，读取并处理输入  
+    char buf[1024];  
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);  
+    if (n > 0) {  
+	buf[n] = '\0'; // 添加字符串终止符  
+	printf("Read from stdin: %s\n", buf);  
+    }  
+}
+```
+select的用法主要涉及到几个关键的参数和步骤。首先，你需要准备三个文件描述符集合：readfds、writefds和exceptfds，分别用于监视读事件、写事件和异常事件。然后，通过select()系统调用，将这三个集合以及超时时间作为参数传入。select()会阻塞进程，直到有文件描述符就绪或超时为止。当select()返回时，它会修改传入的文件描述符集合，以指示哪些文件描述符已就绪。你可以通过检查这些集合来确定哪些文件描述符可以进行读/写操作或出现了异常。
+
+## select的缺点：
+
++ 文件描述符数量限制：select使用fd_set数据结构来存储文件描述符，这个数据结构的大小是固定的。在一些系统上，这个大小被限制为FD_SETSIZE（通常是1024），这意味着select最多只能监视1024个文件描述符。当需要监视的文件描述符数量超过这个限制时，select就无法满足需求。
+
++ 效率问题：每次调用select都需要将所有的文件描述符从用户空间复制到内核空间，这可能会导致性能问题。特别是当需要监视大量的文件描述符时，这种复制操作会带来显著的性能开销。
+
++ 不可扩展性：当需要监视的文件描述符数量增加时，select的性能可能会下降。这是因为它需要遍历整个fd_set来检查哪个文件描述符已就绪，这种遍历操作在文件描述符数量很多时是非常低效的。
+
++ 不支持超时精度：select的超时参数是一个struct timeval结构，它的精度只能到微秒级别。对于某些需要更高精度时间控制的应用来说，这可能不够精确。
+
++ 事件驱动的局限性：select是一个事件驱动的机制，但它只能监视读、写和错误三种类型的事件。对于更复杂的事件处理需求，select可能无法满足。
+
+## poll的用法
+
+```
+struct pollfd fds[2]; // 定义要监视的文件描述符数组  
+int numfds;  
+int timeout = -1; // -1表示无限等待  
+int ret;
+// 设置第一个文件描述符，监视标准输入  
+fds[0].fd = STDIN_FILENO;  
+fds[0].events = POLLIN; // POLLIN表示读事件  
+fds[0].revents = 0;
+// 调用poll函数  
+ret = poll(fds, 1, timeout);
+if (ret > 0) {  
+// 如果有文件描述符就绪  
+for (numfds = 0; numfds < 1; ++numfds) {  
+    if (fds[numfds].revents & POLLIN) {  
+	if (fds[numfds].fd == STDIN_FILENO) {  
+	    // 处理标准输入  
+	    char buf[1024];  
+	    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);  
+	    if (n > 0) {  
+		buf[n] = '\0';  
+		printf("Read from stdin: %s\n", buf);  
+	    }  
+```
+
+## poll的缺点
+
++ 效率问题：与select类似，poll在每次调用时都需要遍历整个文件描述符集合。当监视大量文件描述符时，这种遍历操作可能导致效率下降。
+
++ 没有文件描述符数量限制的直接提升：虽然poll使用链表来存储文件描述符，从而在理论上没有像select那样的文件描述符数量限制（通常为1024），但实际的限制还是取决于系统资源。当文件描述符数量非常大时，性能仍然可能受到影响。
+
++ 水平触发模式：poll和select都使用水平触发模式（level-triggered），这意味着只要条件满足（例如，数据可读），就会一直通知应用程序，即使应用程序还没有处理完上一次的通知。这可能导致应用程序需要不断处理这些事件，即使它们暂时无法处理更多数据。
+
++ 没有更好的事件通知机制：poll仅仅是select的一个改进版本，并没有提供比select更高级的事件通知机制。在需要更高效和灵活的事件通知时，可能需要使用更现代的机制，如epoll（在Linux中）或kqueue
+
+## epoll的用法
+
+```
+int epollfd, nfds, n;  
+struct epoll_event ev, events[MAX_EVENTS];  
+int stdinfd = STDIN_FILENO;
+epollfd = epoll_create1(0);  // 创建epoll实例，保存文件描述符的空间
+ev.events = EPOLLIN; // 监视读事件  
+ev.data.fd = stdinfd; // 设置与该事件关联的文件描述符  
+epoll_ctl(epollfd, EPOLL_CTL_ADD, stdinfd, &ev); // 在epoll实例中注册该描述符，为了监视可读事件
+// 等待事件发生  
+for (;;) {  
+nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+ // 遍历所有触发的事件  
+for (n = 0; n < nfds; ++n) {  
+    if (events[n].data.fd == stdinfd) {  
+	// 处理标准输入  
+	char buf[1024];  
+	ssize_t count = read(stdinfd, buf, sizeof(buf) - 1);  
+	if (count > 0) {  
+	    buf[count] = '\0';  
+	    printf("Read from stdin: %s\n", buf);  
+	}  
+    }
+```
+
+## epoll的缺点
++ 平台依赖性：epoll是Linux特有的机制，因此它不具有跨平台的兼容性。如果你的应用程序需要在非Linux系统上运行，那么你将无法使用epoll。
+
++ 学习曲线：相对于select和poll，epoll的API和概念可能更为复杂，需要一定的时间来学习和理解。
+
++ 边缘触发模式的问题：虽然epoll可以设置为边缘触发模式（EPOLLET），但这也意味着它需要更多的应用程序逻辑来正确处理事件，尤其是当多个事件同时到达时。
+
++ 资源消耗：虽然epoll在处理大量文件描述符时比select和poll更高效，但它仍然需要一定的系统资源来维护其内部数据结构。在高负载情况下，这些资源的消耗可能成为一个问题。
+
+## select和poll
+select 实现多路复用的方式是，将已连接的 Socket 都放到一个文件描述符集合，然后调用 select 函数将文件描述符集合拷贝到内核里，让内核来检查是否有网络事件产生，检查的方式很粗暴，就是通过遍历文件描述符集合的方式，当检查到有事件产生后，将此 Socket 标记为可读或可写， 接着再把整个文件描述符集合拷贝回用户态里，然后用户态还需要再通过遍历的方法找到可读或可写的 Socket，然后再对其处理。
+
+所以，对于 select 这种方式，需要进行 2 次「遍历」文件描述符集合，一次是在内核态里，一个次是在用户态里 ，而且还会发生 2 次「拷贝」文件描述符集合，先从用户空间传入内核空间，由内核修改后，再传出到用户空间中。
+
+select 使用固定长度的 BitsMap，表示文件描述符集合，而且所支持的文件描述符的个数是有限制的，在 Linux 系统中，由内核中的 FD_SETSIZE 限制， 默认最大值为 1024，只能监听 0~1023 的文件描述符。
+
+poll 不再用 BitsMap 来存储所关注的文件描述符，取而代之用动态数组，以链表形式来组织，突破了 select 的文件描述符个数限制，当然还会受到系统文件描述符限制。
+
+但是 poll 和 select 并没有太大的本质区别，都是使用「线性结构」存储进程关注的 Socket 集合，因此都需要遍历文件描述符集合来找到可读或可写的 Socket，时间复杂度为 O(n)，而且也需要在用户态与内核态之间拷贝文件描述符集合，这种方式随着并发数上来，性能的损耗会呈指数级增长。
+
+## epoll
+epoll 通过两个方面，很好解决了 select/poll 的问题。
+
+第一点，epoll 在内核里使用红黑树来跟踪进程所有待检测的文件描述字，把需要监控的 socket 通过 epoll_ctl() 函数加入内核中的红黑树里，红黑树是个高效的数据结构，增删改一般时间复杂度是 O(logn)。而 select/poll 内核里没有类似 epoll 红黑树这种保存所有待检测的 socket 的数据结构，所以 select/poll 每次操作时都传入整个 socket 集合给内核，而 epoll 因为在内核维护了红黑树，可以保存所有待检测的 socket ，所以只需要传入一个待检测的 socket，减少了内核和用户空间大量的数据拷贝和内存分配。
+
+第二点， epoll 使用事件驱动的机制，内核里维护了一个链表来记录就绪事件，当某个 socket 有事件发生时，通过回调函数内核会将其加入到这个就绪事件列表中，当用户调用 epoll_wait() 函数时，只会返回有事件发生的文件描述符的个数，不需要像 select/poll 那样轮询扫描整个 socket 集合，大大提高了检测的效率。
+
