@@ -174,55 +174,94 @@ weak_ptr用于解决shared_ptr循环引用时，引用计数无法降为0导致�
 > https://blog.csdn.net/Xiejingfa/article/details/50772571
 ## shared_ptr实现
 > https://zhuanlan.zhihu.com/p/64543967
-```
-template<typename T>
-class sharedPtr {
-private:
-    T* _ptr;
-    int* _count;
-public:
-    // 构造函数
-    sharedPtr(T* ptr) : _ptr(ptr) {
-        _count = new int(1);
-    }
-    // 拷贝构造函数
-    sharedPtr(const sharedPtr& rhs): _ptr(rhs._ptr), _count(rhs._count){
-        *_count++;
-    }
-    // 赋值运算符
-    sharedPtr& operator= (const sharedPtr& rhs) {
-        if (this == &rhs) {
-            return *this;
-        }
-        reset(); // 减少左边引用计数
-        _ptr = rhs._ptr;
-        _count = rhs._count;
-        *_count++;
-        return *this;
-    }
 
-    // 析构函数
-    ~sharedPtr() {
-        reset();
-    }
-    // 获取原始指针
-    T* get() {
-        return _ptr;
-    }
-    // 获取引用计数
-    int count() {
-        return _count ? *_count ? 0;
-    }
-    void reset() {
-        if (_count) {
-            --*_count;
-            if (*_count == 0) {
-                delete _ptr;
-                delete _count;
-            }
-        }
-    }
-};
+
+SharedPtr 类维护一个指向对象的指针 ptr 和一个指向引用计数器的指针 ref_count。在构造函数、拷贝构造函数和赋值操作符中，我们适当地增加或减少引用计数器的值。当引用计数器的值减少到 0 时，我们删除对象并删除引用计数器
+
+```
+#include <iostream>  
+#include <memory> // For std::allocator  
+#include <atomic> // For std::atomic  
+  
+template <typename T>  
+class SharedPtr {  
+private:  
+    T* ptr;  
+    std::atomic<long>* ref_count;  
+  
+public:  
+    SharedPtr(T* p = nullptr) : ptr(p), ref_count(new std::atomic<long>(1)) {  
+        if (p) {  
+            std::cout << "SharedPtr constructor: Allocating new object " << p << std::endl;  
+        }  
+    }  
+  
+    SharedPtr(const SharedPtr& other) : ptr(other.ptr), ref_count(other.ref_count) {  
+        if (ref_count) {  
+            ++(*ref_count);  
+            std::cout << "SharedPtr copy constructor: Incremented refcount to " << *ref_count << std::endl;  
+        }  
+    }  
+  
+    SharedPtr& operator=(const SharedPtr& other) {  
+        if (this != &other) {  
+            if (ref_count && --(*ref_count) == 0) {  
+                delete ptr;  
+                delete ref_count;  
+                std::cout << "SharedPtr destructor: Deleting object " << ptr << " and refcount" << std::endl;  
+            }  
+  
+            ptr = other.ptr;  
+            ref_count = other.ref_count;  
+            if (ref_count) {  
+                ++(*ref_count);  
+                std::cout << "SharedPtr assignment operator: Incremented refcount to " << *ref_count << std::endl;  
+            }  
+        }  
+        return *this;  
+    }  
+  
+    ~SharedPtr() {  
+        if (ref_count && --(*ref_count) == 0) {  
+            delete ptr;  
+            delete ref_count;  
+            std::cout << "SharedPtr destructor: Deleting object " << ptr << " and refcount" << std::endl;  
+        }  
+    }  
+  
+    T& operator*() const {  
+        return *ptr;  
+    }  
+  
+    T* operator->() const {  
+        return ptr;  
+    }  
+  
+    bool operator==(const SharedPtr& other) const {  
+        return ptr == other.ptr;  
+    }  
+  
+    bool operator!=(const SharedPtr& other) const {  
+        return ptr != other.ptr;  
+    }  
+  
+    long use_count() const {  
+        return ref_count ? *ref_count : 0;  
+    }  
+};  
+  
+int main() {  
+    SharedPtr<int> p1(new int(5));  
+    SharedPtr<int> p2 = p1;  
+    SharedPtr<int> p3;  
+    p3 = p1;  
+  
+    std::cout << "p1 use_count: " << p1.use_count() << std::endl;  
+    std::cout << "p2 use_count: " << p2.use_count() << std::endl;  
+    std::cout << "p3 use_count: " << p3.use_count() << std::endl;  
+  
+    return 0;  
+}
 ```
 
 # 说一说你理解的内存对齐以及原因
