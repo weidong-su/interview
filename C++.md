@@ -1374,3 +1374,7 @@ dealloc(void* ptr) 方法：用于回收内存块。它遍历 freeChunks_ 列表
 # 十大排序算法
 
 > https://blog.csdn.net/qq_35344198/article/details/106857042
+
+# C++对象模型
+
+> https://www.cnblogs.com/QG-whz/p/4909359.html
