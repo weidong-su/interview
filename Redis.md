@@ -1,3 +1,6 @@
+# 在线redis环境：https://try.redis.io/
+
+
 # Redis怎么实现分布式锁？
 
 Redis实现分布式锁主要依赖于其提供的setnx（set if not exist）命令，这个命令可以在指定的key不存在时，为key设置指定的值。如果key已经存在，则setnx不做任何动作。利用这个特性，我们可以将key视为锁，value视为锁的持有者。
