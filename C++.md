@@ -272,648 +272,187 @@ int main() {
 
 ## 考虑weak_count的实现：https://blog.csdn.net/xp178171640/article/details/102674428
 
-```
-考虑weak_count,实现一个线程安全的sharedptr
+
+以下是一个简单实现的`shared_ptr`和`weak_ptr`，提供与标准库`std::shared_ptr`和`std::weak_ptr`相同的功能：
 
 ```cpp
 #include <iostream>
 #include <atomic>
 
 template <typename T>
-class SharedPtr {
+class control_block {
 public:
-    SharedPtr(T* ptr) : ptr(ptr), ref_count(new std::atomic<int>(1)), weak_count(new std::atomic<int>(0)) {}
+    control_block(T* ptr) : ptr_(ptr), ref_count_(1), weak_count_(0) {}
 
-    SharedPtr(const SharedPtr& other) : ptr(other.ptr), ref_count(other.ref_count), weak_count(other.weak_count) {
-        ++(*ref_count);
+    void increment_ref_count() {
+        ++ref_count_;
     }
 
-    SharedPtr& operator=(const SharedPtr& other) {
-        if (this != &other) {
-            if (--(*ref_count) == 0) {
-                delete ptr;
-                delete ref_count;
-                delete weak_count;
-            }
-            ptr = other.ptr;
-            ref_count = other.ref_count;
-            weak_count = other.weak_count;
-            ++(*ref_count);
-        }
-        return *this;
+    void increment_weak_count() {
+        ++weak_count_;
     }
 
-    ~SharedPtr() {
-        if (--(*ref_count) == 0) {
-            delete ptr;
-            delete ref_count;
-            delete weak_count;
+    void decrement_ref_count() {
+        if (--ref_count_ == 0) {
+            delete ptr_;
+            delete this;
         }
+    }
+
+    void decrement_weak_count() {
+        if (--weak_count_ == 0 && ref_count_ == 0) {
+            delete this;
+        }
+    }
+
+    int use_count() const {
+        return ref_count_;
     }
 
     T* get() const {
-        return ptr;
-    }
-
-    void reset(T* new_ptr) {
-        if (--(*ref_count) == 0) {
-            delete ptr;
-            delete ref_count;
-            delete weak_count;
-        }
-        ptr = new_ptr;
-        ref_count = new std::atomic<int>(1);
-    }
-
-    int use_count() const {
-        return *ref_count;
+        return ptr_;
     }
 
 private:
-    T* ptr;
-    std::atomic<int>* ref_count;
-    std::atomic<int>* weak_count;
-};
-
-int main() {
-    SharedPtr<int> sp1(new int(5));
-    SharedPtr<int> sp2 = sp1;
-
-    std::cout << "sp1 use count: " << sp1.use_count() << std::endl;
-    std::cout << "sp2 use count: " << sp2.use_count() << std::endl;
-
-    return 0;
-}
-```
-
-这里使用了`std::atomic<int>`来保证`ref_count`和`weak_count`的线程安全性，确保在多线程环
-
-实现weak_ptr和shared_ptr，需要考虑shared_count和weak_count
-
-```cpp
-#include <iostream>
-#include <atomic>
-
-template <typename T>
-class SharedPtr;
-
-template <typename T>
-class WeakPtr;
-
-template <typename T>
-class SharedCount {
-public:
-    SharedCount() : shared_count(new std::atomic<int>(1)), weak_count(new std::atomic<int>(0)) {}
-
-    void incrementShared() {
-        ++(*shared_count);
-    }
-
-    void incrementWeak() {
-        ++(*weak_count);
-    }
-
-    void decrementShared() {
-        if (--(*shared_count) == 0) {
-            delete shared_count;
-            delete weak_count;
-        }
-    }
-
-    void decrementWeak() {
-        if (--(*weak_count) == 0 && *shared_count == 0) {
-            delete shared_count;
-            delete weak_count;
-        }
-    }
-
-    int getSharedCount() const {
-        return *shared_count;
-    }
-
-private:
-    std::atomic<int>* shared_count;
-    std::atomic<int>* weak_count;
-
-    friend class SharedPtr<T>;
-    friend class WeakPtr<T>;
+    T* ptr_;
+    std::atomic<int> ref_count_;
+    std::atomic<int> weak_count_;
 };
 
 template <typename T>
-class SharedPtr {
-public:
-    SharedPtr(T* ptr) : ptr(ptr), shared_count(new SharedCount<T>()) {}
+class weak_ptr;
 
-    SharedPtr(const SharedPtr& other) : ptr(other.ptr), shared_count(other.shared_count) {
-        shared_count->incrementShared();
+template <typename T>
+class shared_ptr {
+public:
+    shared_ptr() : ptr_(nullptr), control_block_(nullptr) {}
+
+    explicit shared_ptr(T* ptr) : ptr_(ptr), control_block_(new control_block<T>(ptr)) {}
+
+    shared_ptr(const shared_ptr& other) : ptr_(other.ptr_), control_block_(other.control_block_) {
+        if (control_block_) {
+            control_block_->increment_ref_count();
+        }
     }
 
-    SharedPtr& operator=(const SharedPtr& other) {
+    shared_ptr& operator=(const shared_ptr& other) {
         if (this != &other) {
-            shared_count->decrementShared();
-            shared_count = other.shared_count;
-            ptr = other.ptr;
-            shared_count->incrementShared();
-        }
-        return *this;
-    }
-
-    ~SharedPtr() {
-        shared_count->decrementShared();
-    }
-
-    int use_count() const {
-        return shared_count->getSharedCount();
-    }
-
-private:
-    T* ptr;
-    SharedCount<T>* shared_count;
-
-    friend class WeakPtr<T>;
-};
-
-template <typename T>
-class WeakPtr {
-public:
-    WeakPtr(const SharedPtr<T>& shared_ptr) : ptr(shared_ptr.ptr), shared_count(shared_ptr.shared_count) {
-        shared_count->incrementWeak();
-    }
-
-    WeakPtr(const WeakPtr& other) : ptr(other.ptr), shared_count(other.shared_count) {
-        shared_count->incrementWeak();
-    }
-
-    WeakPtr& operator=(const WeakPtr& other) {
-        if (this != &other) {
-            shared_count->decrementWeak();
-            shared_count = other.shared_count;
-            ptr = other.ptr;
-            shared_count->incrementWeak();
-        }
-        return *this;
-    }
-
-    ~WeakPtr() {
-        shared_count->decrementWeak();
-    }
-
-    int use_count() const {
-        return shared_count->getSharedCount();
-    }
-
-private:
-    T* ptr;
-    SharedCount<T>* shared_count;
-
-    friend class SharedPtr<T>;
-};
-
-int main() {
-    SharedPtr<int> sp1(new int(5));
-    SharedPtr<int> sp2 = sp1;
-
-    WeakPtr<int> wp1 = sp1;
-    WeakPtr<int> wp2 = wp1;
-
-    std::cout << "sp1 use count: " << sp1.use_count() << std::endl;
-    std::cout << "sp2 use count: " << sp2.use_count() << std::endl;
-    std::cout << "wp1 use count: " << wp1.use_count() << std::endl;
-    std::cout << "wp2 use count: " << wp2.use_count() << std::endl;
-
-    return 0;
-}
-``` 
-
-在这个示例中，我们实现了`SharedCount`类来跟踪`shared_count`和`weak_count`，并且`SharedPtr`和`WeakPtr`类分别持有`SharedCount`指针。这样可以确保正确地管理引用计数，从而实现`shared_ptr`和`weak_ptr`的功能。
-
-简单实现C++线程安全的shared_ptr和weak_ptr，以及相互转化
-
-```cpp
-#include <iostream>
-#include <atomic>
-
-template <typename T>
-class SharedPtr;
-
-template <typename T>
-class WeakPtr;
-
-template <typename T>
-class ControlBlock {
-public:
-    ControlBlock(T* ptr) : ptr(ptr), ref_count(new std::atomic<int>(1)), weak_count(new std::atomic<int>(0)) {}
-
-    void incrementRefCount() {
-        ++(*ref_count);
-    }
-
-    void incrementWeakCount() {
-        ++(*weak_count);
-    }
-
-    void decrementRefCount() {
-        if (--(*ref_count) == 0) {
-            delete ptr;
-            delete ref_count;
-            delete weak_count;
-        }
-    }
-
-    void decrementWeakCount() {
-        if (--(*weak_count) == 0 && *ref_count == 0) {
-            delete ptr;
-            delete ref_count;
-            delete weak_count;
-        }
-    }
-
-    int getRefCount() const {
-        return *ref_count;
-    }
-
-private:
-    T* ptr;
-    std::atomic<int>* ref_count;
-    std::atomic<int>* weak_count;
-
-    friend class SharedPtr<T>;
-    friend class WeakPtr<T>;
-};
-
-template <typename T>
-class SharedPtr {
-public:
-    SharedPtr(T* ptr) : control_block(new ControlBlock<T>(ptr)) {}
-
-    SharedPtr(const SharedPtr& other) : control_block(other.control_block) {
-        control_block->incrementRefCount();
-    }
-
-    SharedPtr& operator=(const SharedPtr& other) {
-        if (this != &other) {
-            control_block->decrementRefCount();
-            control_block = other.control_block;
-            control_block->incrementRefCount();
-        }
-        return *this;
-    }
-
-    ~SharedPtr() {
-        control_block->decrementRefCount();
-    }
-
-    int use_count() const {
-        return control_block->getRefCount();
-    }
-
-    WeakPtr<T> to_weak() {
-        control_block->incrementWeakCount();
-        return WeakPtr<T>(control_block);
-    }
-
-private:
-    ControlBlock<T>* control_block;
-
-    friend class WeakPtr<T>;
-};
-
-template <typename T>
-class WeakPtr {
-public:
-    WeakPtr(ControlBlock<T>* control_block) : control_block(control_block) {
-        control_block->incrementWeakCount();
-    }
-
-    WeakPtr(const WeakPtr& other) : control_block(other.control_block) {
-        control_block->incrementWeakCount();
-    }
-
-    WeakPtr& operator=(const WeakPtr& other) {
-        if (this != &other) {
-            control_block->decrementWeakCount();
-            control_block = other.control_block;
-            control_block->incrementWeakCount();
-        }
-        return *this;
-    }
-
-    ~WeakPtr() {
-        control_block->decrementWeakCount();
-    }
-
-    SharedPtr<T> lock() {
-        if (control_block->getRefCount() > 0) {
-            return SharedPtr<T>(control_block->ptr);
-        } else {
-            return SharedPtr<T>(nullptr);
-        }
-    }
-
-private:
-    ControlBlock<T>* control_block;
-
-    friend class SharedPtr<T>;
-};
-
-int main() {
-    SharedPtr<int> sp1(new int(5));
-    SharedPtr<int> sp2 = sp1;
-
-    WeakPtr<int> wp = sp1.to_weak();
-
-    SharedPtr<int> sp3 = wp.lock();
-
-    std::cout << "sp1 use count: " << sp1.use_count() << std::endl;
-    std::cout << "sp2 use count: " << sp2.use_count() << std::endl;
-    std::cout << "wp use count: " << wp.control_block->getRefCount() << std::endl;
-    std::cout << "sp3 use count: " << sp3.use_count() << std::endl;
-
-    return 0;
-}
-```
-
-在这个示例中，我们实现了线程安全的`SharedPtr`和`WeakPtr`类，以及`ControlBlock`类来管理引用计数。`SharedPtr`类持有`ControlBlock`指针，`WeakPtr`类可以通过`to_weak`方法从`SharedPtr`转为`WeakPtr`，并且可以通过`lock`方法从`WeakPtr`转回`SharedPtr`。这样可以确保正确地管理引用计数，实现`shared_ptr`和`weak_ptr`的功能。
-
-简单实现C++线程安全的shared_ptr和weak_ptr，以及相互转化。lock时不要增加引用计数
-
-```cpp
-#include <iostream>
-#include <atomic>
-
-template <typename T>
-class WeakPtr;
-
-template <typename T>
-class SharedPtr {
-public:
-    SharedPtr(T* ptr) : ptr(ptr), ref_count(new std::atomic<int>(1)), weak_count(new std::atomic<int>(0)) {}
-
-    SharedPtr(const SharedPtr& other) : ptr(other.ptr), ref_count(other.ref_count), weak_count(other.weak_count) {
-        ++(*ref_count);
-    }
-
-    SharedPtr& operator=(const SharedPtr& other) {
-        if (this != &other) {
-            if (--(*ref_count) == 0) {
-                delete ptr;
-                delete ref_count;
-                delete weak_count;
+            if (control_block_) {
+                control_block_->decrement_ref_count();
             }
-            ptr = other.ptr;
-            ref_count = other.ref_count;
-            weak_count = other.weak_count;
-            ++(*ref_count);
+            ptr_ = other.ptr_;
+            control_block_ = other.control_block_;
+            if (control_block_) {
+                control_block_->increment_ref_count();
+            }
         }
         return *this;
     }
 
-    ~SharedPtr() {
-        if (--(*ref_count) == 0) {
-            delete ptr;
-            delete ref_count;
-            delete weak_count;
+    ~shared_ptr() {
+        if (control_block_) {
+            control_block_->decrement_ref_count();
         }
     }
 
-    T* get() const {
-        return ptr;
+    T& operator*() const {
+        return *ptr_;
     }
 
-    WeakPtr<T> to_weak() {
-        return WeakPtr<T>(ptr, ref_count, weak_count);
+    T* operator->() const {
+        return ptr_;
     }
 
     int use_count() const {
-        return *ref_count;
+        return control_block_ ? control_block_->use_count() : 0;
+    }
+
+    weak_ptr<T> weak() {
+        if (control_block_) {
+            control_block_->increment_weak_count();
+        }
+        return weak_ptr<T>(ptr_, control_block_);
     }
 
 private:
-    T* ptr;
-    std::atomic<int>* ref_count;
-    std::atomic<int>* weak_count;
+    T* ptr_;
+    control_block<T>* control_block_;
 
-    friend class WeakPtr<T>;
+    template <typename U>
+    friend class weak_ptr;
 };
 
 template <typename T>
-class WeakPtr {
+class weak_ptr {
 public:
-    WeakPtr(T* ptr, std::atomic<int>* ref_count, std::atomic<int>* weak_count)
-        : ptr(ptr), ref_count(ref_count), weak_count(weak_count) {
-        ++(*weak_count);
+    weak_ptr() : ptr_(nullptr), control_block_(nullptr) {}
+
+    weak_ptr(T* ptr, control_block<T>* control_block) : ptr_(ptr), control_block_(control_block) {}
+
+    weak_ptr(const weak_ptr& other) : ptr_(other.ptr_), control_block_(other.control_block_) {
+        if (control_block_) {
+            control_block_->increment_weak_count();
+        }
     }
 
-    WeakPtr(const WeakPtr& other)
-        : ptr(other.ptr), ref_count(other.ref_count), weak_count(other.weak_count) {
-        ++(*weak_count);
-    }
-
-    WeakPtr& operator=(const WeakPtr& other) {
+    weak_ptr& operator=(const weak_ptr& other) {
         if (this != &other) {
-            ptr = other.ptr;
-            ref_count = other.ref_count;
-            weak_count = other.weak_count;
-            ++(*weak_count);
+            if (control_block_) {
+                control_block_->decrement_weak_count();
+            }
+            ptr_ = other.ptr_;
+            control_block_ = other.control_block_;
+            if (control_block_) {
+                control_block_->increment_weak_count();
+            }
         }
         return *this;
     }
 
-    ~WeakPtr() {
-        if (--(*weak_count) == 0) {
-            delete weak_count;
+    ~weak_ptr() {
+        if (control_block_) {
+            control_block_->decrement_weak_count();
         }
     }
 
-    SharedPtr<T> lock() {
-        if (*ref_count > 0) {
-            return SharedPtr<T>(ptr);
-        } else {
-            return SharedPtr<T>(nullptr);
+    shared_ptr<T> lock() const {
+        if (expired()) {
+            return shared_ptr<T>();
         }
+        return shared_ptr<T>(ptr_, control_block_);
+    }
+
+    bool expired() const {
+        return control_block_ == nullptr || control_block_->use_count() == 0;
     }
 
 private:
-    T* ptr;
-    std::atomic<int>* ref_count;
-    std::atomic<int>* weak_count;
+    T* ptr_;
+    control_block<T>* control_block_;
 
-    friend class SharedPtr<T>;
+    template <typename U>
+    friend class shared_ptr;
 };
 
 int main() {
-    SharedPtr<int> sp1(new int(5));
-    SharedPtr<int> sp2 = sp1;
+    shared_ptr<int> sp1(new int(5));
+    shared_ptr<int> sp2 = sp1;
 
-    WeakPtr<int> wp1 = sp1.to_weak();
-    WeakPtr<int> wp2 = wp1;
+    weak_ptr<int> wp = sp1.weak();
 
-    SharedPtr<int> sp3 = wp1.lock();
+    shared_ptr<int> sp3 = wp.lock();
 
     std::cout << "sp1 use count: " << sp1.use_count() << std::endl;
     std::cout << "sp2 use count: " << sp2.use_count() << std::endl;
-    std::cout << "wp1 use count: " << *wp1.ref_count << std::endl;
-    std::cout << "wp2 use count: " << *wp2.ref_count << std::endl;
+    std::cout << "wp expired: " << wp.expired() << std::endl;
     std::cout << "sp3 use count: " << sp3.use_count() << std::endl;
 
     return 0;
 }
 ```
 
-在这个示例中，我们实现了线程安全的`SharedPtr`和`WeakPtr`类，`SharedPtr`类持有被管理的指针以及引用计数，`WeakPtr`类持有被管理的指针以及弱引用计数。在`lock`方法中，不会增加引用计数，只是返回一个新的`SharedPtr`实例。这样可以确保正确地管理引用计数，实现`shared_ptr`和`weak_ptr`的功能。
+这个实现包括`shared_ptr`类和`weak_ptr`类，以及`control_block`类来管理引用计数。`shared_ptr`类可以用于共享指针，而`weak_ptr`类可用于弱引用，以避免循环引用。通过`lock`方法可以获取`shared_ptr`实例，通过`expired`方法判断是否已失效。
 
-用sharedcount类管理
-
-```cpp
-#include <iostream>
-#include <atomic>
-
-template <typename T>
-class SharedCount;
-
-template <typename T>
-class SharedPtr;
-
-template <typename T>
-class WeakPtr;
-
-template <typename T>
-class SharedCount {
-public:
-    SharedCount() : ref_count(new std::atomic<int>(1)), weak_count(new std::atomic<int>(0)) {}
-
-    void incrementRefCount() {
-        ++(*ref_count);
-    }
-
-    void incrementWeakCount() {
-        ++(*weak_count);
-    }
-
-    void decrementRefCount() {
-        if (--(*ref_count) == 0) {
-            delete ref_count;
-            delete weak_count;
-        }
-    }
-
-    void decrementWeakCount() {
-        if (--(*weak_count) == 0 && *ref_count == 0) {
-            delete ref_count;
-            delete weak_count;
-        }
-    }
-
-    int getRefCount() const {
-        return *ref_count;
-    }
-
-private:
-    std::atomic<int>* ref_count;
-    std::atomic<int>* weak_count;
-
-    friend class SharedPtr<T>;
-    friend class WeakPtr<T>;
-};
-
-template <typename T>
-class SharedPtr {
-public:
-    SharedPtr(T* ptr) : ptr(ptr), shared_count(new SharedCount<T>()) {}
-
-    SharedPtr(const SharedPtr& other) : ptr(other.ptr), shared_count(other.shared_count) {
-        shared_count->incrementRefCount();
-    }
-
-    SharedPtr& operator=(const SharedPtr& other) {
-        if (this != &other) {
-            shared_count->decrementRefCount();
-            shared_count = other.shared_count;
-            ptr = other.ptr;
-            shared_count->incrementRefCount();
-        }
-        return *this;
-    }
-
-    ~SharedPtr() {
-        shared_count->decrementRefCount();
-    }
-
-    WeakPtr<T> toWeak() {
-        shared_count->incrementWeakCount();
-        return WeakPtr<T>(ptr, shared_count);
-    }
-
-    int use_count() const {
-        return shared_count->getRefCount();
-    }
-
-private:
-    T* ptr;
-    SharedCount<T>* shared_count;
-
-    friend class WeakPtr<T>;
-};
-
-template <typename T>
-class WeakPtr {
-public:
-    WeakPtr(T* ptr, SharedCount<T>* shared_count) : ptr(ptr), shared_count(shared_count) {
-        shared_count->incrementWeakCount();
-    }
-
-    WeakPtr(const WeakPtr& other) : ptr(other.ptr), shared_count(other.shared_count) {
-        shared_count->incrementWeakCount();
-    }
-
-    WeakPtr& operator=(const WeakPtr& other) {
-        if (this != &other) {
-            shared_count->decrementWeakCount();
-            shared_count = other.shared_count;
-            ptr = other.ptr;
-            shared_count->incrementWeakCount();
-        }
-        return *this;
-    }
-
-    ~WeakPtr() {
-        shared_count->decrementWeakCount();
-    }
-
-    SharedPtr<T> lock() {
-        if (shared_count->getRefCount() > 0) {
-            return SharedPtr<T>(ptr);
-        } else {
-            return SharedPtr<T>(nullptr);
-        }
-    }
-
-private:
-    T* ptr;
-    SharedCount<T>* shared_count;
-
-    friend class SharedPtr<T>;
-};
-
-int main() {
-    SharedPtr<int> sp1(new int(5));
-    SharedPtr<int> sp2 = sp1;
-
-    WeakPtr<int> wp = sp1.toWeak();
-
-    SharedPtr<int> sp3 = wp.lock();
-
-    std::cout << "sp1 use count: " << sp1.use_count() << std::endl;
-    std::cout << "sp2 use count: " << sp2.use_count() << std::endl;
-    std::cout << "wp use count: " << wp.shared_count->getRefCount() << std::endl;
-    std::cout << "sp3 use count: " << sp3.use_count() << std::endl;
-
-    return 0;
-}
-```
-
-在这个示例中，我们使用`SharedCount`类来管理引用计数和弱引用计数，确保线程安全。`SharedPtr`类持有指针和`SharedCount`实例，而`WeakPtr`类持有指针和`SharedCount`实例。在`lock`方法中，不会增加引用计数，只是返回一个新的`SharedPtr`实例。这样可以确保正确地管理引用计数，实现`shared_ptr`和`weak_ptr`的功能。
-```
 
 # 说一说你理解的内存对齐以及原因
 内存对齐是一种编程优化技术，用于提高计算机硬件的性能和效率。内存对齐是指将数据按照特定的对齐边界进行存储，通常是为了使数据能够更快地被访问和操作。
