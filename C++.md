@@ -88,6 +88,10 @@ mutable，对应 LambdaClass类成员函数 operator() 的const属性 ，但是�
 # C++ 11有哪些新特性
 > https://www.jianshu.com/p/aaf789b64667
 
+# C++auto原理
+https://www.cnblogs.com/harlanc/p/10628321.html
+
+
 # 讲一下程序的内存分区/内存模型？
 在C++程序中，内存可以分为如下区域：
 1. 代码区：也称为文本区，用于存储程序的二进制代码。该区域是只读的，防止在程序运行过程中意外修改自身的代码。
