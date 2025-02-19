@@ -132,21 +132,27 @@ public:
 ```
 
 3.2 推导关键路径：
-实例化V<None>：
++ 实例化V<None>：
 
-Cpp
+```cpp
 ReqView<None> → MsgView<None, ThreadData, ReqView>
-获取MsgType：
+```
++ 获取MsgType：
 
-Cpp
+```cpp
 MsgView<None, ThreadData, ReqView>::MsgType → ThreadData
-构造InView：
+```
 
-Cpp
++ 构造InView：
+
+```cpp
 typedef InputView<ViewType> InView; 
 // ViewType = ReqView<None> = MsgView<None, ThreadData, ReqView>
-3.3 InputView的具体实现
-Cpp
+```
+
++ InputView的具体实现
+
+```cpp
 template <typename ViewType>
 struct InputView : public ViewType {
     // 关键构造函数
@@ -161,9 +167,11 @@ struct InputView : public ViewType {
 private:
     const typename ViewType::MsgType* _msg; // 最终存储为const指针
 };
-4. 内存结构验证
-4.1 示例代码
-Cpp
+```
+
++ 示例代码
+
+```cpp
 ThreadData data;
 In<ReqView> input(&data);
 
@@ -175,7 +183,7 @@ struct In_ReqView {
     
     InView_ReqView _v{&data}; // 初始化
 };
-
+```
 
 
 内存布局：
