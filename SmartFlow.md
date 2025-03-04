@@ -639,3 +639,170 @@ while (node) {
 ---
 
 通过以上逐层展开，可以清晰看到从用户调用到底层协程启动的完整代码路径，理解框架如何通过模板元编程和宏定义实现灵活的任务调度。
+
+# 
+以下是 `SyncExecutor`、`AsyncExecutor` 和 `NoStealingExecutor` 的详细对比解析：
+
+---
+
+### **1. 核心设计差异**
+| **执行器类型**       | **执行模式** | **线程/协程使用**          | **适用场景**                 |
+|----------------------|--------------|--------------------------|----------------------------|
+| **SyncExecutor**     | 同步         | 当前线程直接执行           | 简单任务、无需并发           |
+| **AsyncExecutor**    | 异步         | 普通协程（可被窃取任务）    | 高吞吐量、通用并发任务       |
+| **NoStealingExecutor** | 异步         | 不可窃取协程（绑定Worker） | 低延迟、实时性要求高的任务   |
+
+---
+
+### **2. 实现细节对比**
+#### **`SyncExecutor`**
+- **代码实现**：
+  ```cpp
+  template <typename O, typename F, typename... Args>
+  void batch(NodeInstance* node, O&& o, F&& fn, Args&&... args) {
+      (o->*fn)(args...);  // 直接调用成员函数
+  }
+  ```
+- **关键行为**：
+  - **同步阻塞**：任务立即在当前线程执行，函数返回前任务已完成。
+  - **无并发开销**：不涉及线程或协程切换，适合简单快速操作。
+- **适用场景**：
+  - 数据校验、日志记录等轻量级任务。
+  - 需要严格顺序执行的场景。
+
+#### **`AsyncExecutor`**
+- **代码实现**：
+  ```cpp
+  template <typename F, typename... Args>
+  void batch(NodeInstance* node, F&& fn, Args&&... args) {
+      schedule_switchable(node, std::forward<F>(fn), std::forward<Args>(args)...);
+  }
+  ```
+- **关键行为**：
+  - **协程异步**：通过 `schedule_switchable` 提交任务到协程池。
+  - **任务窃取**：协程可能被其他空闲Worker线程窃取，最大化资源利用率。
+- **适用场景**：
+  - 并行处理IO密集型任务（如网络请求、文件读写）。
+  - 大规模数据处理（如批量计算、ETL）。
+
+#### **`NoStealingExecutor`**
+- **代码实现**：
+  ```cpp
+  template <typename F, typename... Args>
+  void batch(NodeInstance* node, F&& fn, Args&&... args) {
+      schedule_nostealing(node, std::forward<F>(fn), std::forward<Args>(args)...);
+  }
+  ```
+- **关键行为**：
+  - **不可窃取协程**：协程绑定到指定Worker线程，避免任务迁移。
+  - **低延迟保障**：减少线程切换和缓存失效。
+- **适用场景**：
+  - 高频交易、实时数据处理。
+  - 需要确定性执行时间的任务（如金融风控）。
+
+---
+
+### **3. 性能与资源对比**
+| **指标**             | **SyncExecutor** | **AsyncExecutor** | **NoStealingExecutor** |
+|----------------------|-----------------|-------------------|------------------------|
+| **线程/协程开销**    | 无              | 中等              | 低（减少迁移）         |
+| **延迟**             | 最低（无调度）  | 中等              | 最低（绑定线程）       |
+| **吞吐量**           | 低              | 高                | 中等                   |
+| **CPU缓存利用率**    | 高（无切换）    | 低（频繁切换）    | 高（绑定线程）         |
+
+---
+
+### **4. 内部调用链路**
+#### **`AsyncExecutor` 调用流程**
+1. **用户调用**：
+   ```cpp
+   async_executor.batch(node, &MyClass::process, &obj, data);
+   ```
+2. **转发到调度器**：
+   ```cpp
+   schedule_switchable(node, &MyClass::process, &obj, data);
+   ```
+3. **协程启动**：
+   ```cpp
+   executor->schedule_switchable(...); // 启动普通协程
+   ```
+
+#### **`NoStealingExecutor` 调用流程**
+1. **用户调用**：
+   ```cpp
+   no_stealing_executor.batch(node, &MyClass::process, &obj, data);
+   ```
+2. **转发到调度器**：
+   ```cpp
+   schedule_nostealing(node, &MyClass::process, &obj, data);
+   ```
+3. **协程启动**：
+   ```cpp
+   executor->schedule_nostealing(...); // 启动不可窃取协程
+   ```
+
+---
+
+### **5. 典型应用场景代码**
+#### **`SyncExecutor` 示例**
+```cpp
+// 同步执行数据校验
+SyncExecutor sync_executor;
+sync_executor.batch(
+    node, 
+    &Validator::check,  // 成员函数
+    &validator,         // 对象实例
+    transaction_data    // 参数
+);
+```
+
+#### **`AsyncExecutor` 示例**
+```cpp
+// 异步处理HTTP请求
+AsyncExecutor async_executor;
+async_executor.batch(
+    node, 
+    [](Request& req) {  // Lambda函数
+        req.send();
+    }, 
+    http_request
+);
+```
+
+#### **`NoStealingExecutor` 示例**
+```cpp
+// 高频交易订单处理
+NoStealingExecutor no_stealing_executor;
+no_stealing_executor.batch(
+    node, 
+    &OrderEngine::process,  // 成员函数
+    &order_engine,          // 对象实例
+    market_data             // 参数
+);
+```
+
+---
+
+### **6. 设计取舍总结**
+| **执行器**           | **优点**                     | **缺点**                     |
+|----------------------|-----------------------------|------------------------------|
+| **SyncExecutor**     | 零调度开销，简单可靠          | 无法并发，吞吐量低            |
+| **AsyncExecutor**    | 高吞吐，资源利用率高          | 延迟波动较大                  |
+| **NoStealingExecutor** | 低延迟，执行时间可预测        | 资源利用率较低（无法负载均衡） |
+
+---
+
+### **7. 选择建议**
+- **选择 `SyncExecutor`**：
+  - 任务执行时间极短（微秒级）。
+  - 需要严格顺序执行或原子性操作。
+  
+- **选择 `AsyncExecutor`**：
+  - IO密集型或高吞吐计算任务。
+  - 任务执行时间较长（毫秒级），允许一定延迟波动。
+
+- **选择 `NoStealingExecutor`**：
+  - 实时性要求极高（如游戏帧处理、高频交易）。
+  - 需要避免线程切换开销的CPU密集型任务。
+
+通过理解这些差异，开发者可根据业务需求选择最合适的执行器，平衡吞吐量、延迟和资源开销。
