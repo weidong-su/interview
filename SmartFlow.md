@@ -360,3 +360,282 @@ sequenceDiagram
 - 性能优化
 
 最终实现 **高性能**、**高可靠** 的流式处理系统。
+
+
+# BFTL
+
+以下是对 `schedule_switchable`、`schedule_nostealing`、`batch_schedule` 和 `batch_call` 的逐层代码展开解析，从模板展开到最终协程调用：
+
+---
+
+### 一、**`schedule_switchable` 代码展开**
+#### 1. **用户调用**
+```cpp
+executor.schedule_switchable([](int x) { ... }, 42);
+```
+
+#### 2. **宏/模板展开**
+```cpp
+// 原始定义
+template <typename... Args>
+int schedule_switchable(Args&&... args) {
+    return schedule<bthread::STACK_TYPE_NORMAL>(std::forward<Args>(args)...);
+}
+
+// 展开后等价于：
+template <>
+int schedule_switchable<const lambda&, int>(
+    const lambda& f, 
+    int&& arg1
+) {
+    return schedule<bthread::STACK_TYPE_NORMAL>(
+        std::forward<const lambda&>(f), 
+        std::forward<int>(arg1)
+    );
+}
+```
+
+#### 3. **底层调用路径**
+```cpp
+// 调用 schedule<STACK_TYPE_NORMAL>
+-> SingleScheduler<false, STACK_TYPE_NORMAL, lambda, int>::operator()
+-> execute_single_job<STACK_TYPE_NORMAL>(call_fn<Callable<lambda, int>>, callable)
+-> start_bthread(bid, STACK_TYPE_NORMAL, call_fn, callable)
+```
+
+---
+
+### 二、**`schedule_nostealing` 代码展开**
+#### 1. **用户调用（成员函数场景）**
+```cpp
+executor.schedule_nostealing(
+    &MyClass::func,   // F=void(MyClass::*)(int)
+    2,                // worker_index
+    &obj,             // O=MyClass*
+    42                // Args=int
+);
+```
+
+#### 2. **模板推导步骤**
+```cpp
+// 模板参数推导：
+member_function = true (因为F是成员函数指针)
+S = STACK_TYPE_PTHREAD
+F = void(MyClass::*)(int)
+Args = [MyClass*, int]
+
+// 选择 NoStealingSingleScheduler<true, ...>
+using Scheduler = NoStealingSingleScheduler<true, STACK_TYPE_PTHREAD, 
+    void(MyClass::*)(int), MyClass*, int>;
+```
+
+#### 3. **调度器实例化**
+```cpp
+// 调度器的 operator() 展开：
+int operator()(ConcurrentExecutor* exec, 
+    void(MyClass::*&& f)(int), 
+    int&& worker_index, 
+    MyClass*&& o, 
+    int&& arg
+) {
+    // 创建 CallableObject
+    CallableObject<void(MyClass::*)(int), MyClass*, int>* callable = 
+        mempool.create<CallableObject<...>>(
+            std::forward<F>(f), 
+            std::forward<O>(o), 
+            std::forward<int>(arg)
+        );
+
+    // 启动不可窃取协程
+    exec->execute_nostealing_single_job<STACK_TYPE_PTHREAD>(
+        worker_index, 
+        &call_fn<CallableObject<...>>, 
+        callable
+    );
+}
+```
+
+#### 4. **协程启动细节**
+```cpp
+start_nostealing_bthread(
+    &bid, 
+    STACK_TYPE_PTHREAD, 
+    2,  // worker_index
+    call_fn<CallableObject<...>>, 
+    callable
+) {
+    bthread_attr_t attr = {
+        .stack_type = STACK_TYPE_PTHREAD,
+        .flags = _bthread_flag | BTHREAD_NOSTEALING
+    };
+    // 内部调用 brpc的不可窃取协程接口
+    bthread_start_nostealing(
+        &bid, 
+        &attr, 
+        2,  // 绑定到worker 2
+        call_fn, 
+        callable
+    );
+}
+```
+
+---
+
+### 三、**`batch_schedule` 代码展开**
+#### 1. **用户调用**
+```cpp
+executor.batch_schedule(
+    [](int idx, Data& d) { d.process(idx); }, // F=void(*)(int, Data&)
+    1000,   // item_size
+    8,      // concurrent_num
+    data    // Data&
+);
+```
+
+#### 2. **宏展开**
+```cpp
+// BATCH_CALL_FUNCTION(batch_schedule) 展开：
+template <
+    bthread::StackType S, 
+    typename F, 
+    typename std::enable_if<!std::is_member_function_pointer<F>::value, bool>::type, 
+    typename... Args
+>
+void batch_schedule(F&& f, int item_size, int concurrent_num, Args&&... args) {
+    using Scheduler = BatchScheduler<false, S, F, Args...>;
+    Scheduler().batch_schedule(this, item_size, concurrent_num, 
+        std::forward<F>(f), std::forward<Args>(args)...);
+}
+
+// 实例化模板：
+BatchScheduler<false, STACK_TYPE_PTHREAD, 
+    void(*)(int, Data&), Data&>
+```
+
+#### 3. **调度器执行**
+```cpp
+void BatchScheduler::batch_schedule(...) {
+    _callable = mempool.create<BatchCallable<void(*)(int, Data&), Data&>>(
+        std::forward<F>(f), 
+        std::forward<Data&>(data)
+    );
+    _callable->set_item_size(1000);
+    executor->execute_batch_job<STACK_TYPE_PTHREAD>(
+        &call_fn<BatchCallable<...>>, 
+        _callable, 
+        8
+    );
+}
+```
+
+#### 4. **批量协程启动**
+```cpp
+// execute_batch_job 展开：
+for (int i = 0; i < 8; ++i) {
+    execute_single_job<STACK_TYPE_PTHREAD>(
+        &call_fn<BatchCallable<...>>, 
+        _callable
+    );
+}
+```
+
+---
+
+### 四、**`batch_call` 代码展开**
+#### 1. **用户调用**
+```cpp
+executor.batch_call(
+    [](int idx, Data& d) { ... }, 
+    1000, 8, data
+);
+```
+
+#### 2. **与 `batch_schedule` 的差异**
+```cpp
+// batch_call 额外步骤：
+1. 调用 batch_schedule 启动8个协程
+2. 主线程参与处理剩余任务：
+   call_fn<BatchCallable<...>>(_callable);
+3. 等待所有协程完成：
+   executor->join();
+```
+
+#### 3. **主线程任务处理**
+```cpp
+void BatchCallable::run() {
+    while (true) {
+        int index = _item_index.fetch_add(1);
+        if (index >= 1000) break;
+        invoke_tuple(index, _args_tuple, seq);
+    }
+}
+
+// 主线程调用 call_fn 时：
+call_fn(_callable) -> _callable->run();
+// 主线程处理未被协程分配的剩余任务
+```
+
+---
+
+### 五、**关键代码路径总结**
+| 方法                | 核心代码路径                                                                 |
+|---------------------|----------------------------------------------------------------------------|
+| `schedule_switchable` | `schedule<STACK_TYPE_NORMAL>` → `SingleScheduler` → `start_bthread`      |
+| `schedule_nostealing` | `NoStealingSingleScheduler` → `start_nostealing_bthread` → 绑定Worker线程  |
+| `batch_schedule`     | `BatchScheduler` → 创建`BatchCallable` → 启动多个协程                       |
+| `batch_call`         | `batch_schedule` + 主线程处理任务 + `join()`                                |
+
+---
+
+### 六、**模板实例化示例**
+#### 1. **`BatchCallable` 实例化**
+```cpp
+// 用户传递参数类型：
+F = void(*)(int, Data&)
+Args = [Data&]
+
+// 模板实例化：
+BatchCallable<
+    void(*)(int, Data&),   // F
+    Data&                  // Args
+>
+
+// 成员变量：
+_args_tuple = std::tuple<int, Data&>(-1, data)
+```
+
+#### 2. **`invoke_tuple` 展开**
+```cpp
+// 索引序列生成：
+std::index_sequence<0> （因为Args长度=1）
+
+// 展开调用：
+std::invoke(_f, index, std::get<1>(_args_tuple));
+// 等价于：
+_f(index, data);
+```
+
+---
+
+### 七、**内存管理细节**
+#### 1. **内存池分配**
+```cpp
+CallableContainer* callable = 
+    ::im::GlobalMempool::instance()->create_ex<CallableContainer>(...);
+```
+- **实现机制**：  
+  使用内存池对象池技术，避免频繁的 `new/delete` 操作，提升性能。
+
+#### 2. **资源回收**
+```cpp
+// join() 时回收内存：
+while (node) {
+    Node* next = node->next;
+    ::im::GlobalMempool::instance()->destroy(node);
+    node = next;
+}
+```
+
+---
+
+通过以上逐层展开，可以清晰看到从用户调用到底层协程启动的完整代码路径，理解框架如何通过模板元编程和宏定义实现灵活的任务调度。
