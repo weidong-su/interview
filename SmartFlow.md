@@ -640,7 +640,7 @@ while (node) {
 
 通过以上逐层展开，可以清晰看到从用户调用到底层协程启动的完整代码路径，理解框架如何通过模板元编程和宏定义实现灵活的任务调度。
 
-# 
+# SF的执行器对比
 以下是 `SyncExecutor`、`AsyncExecutor` 和 `NoStealingExecutor` 的详细对比解析：
 
 ---
