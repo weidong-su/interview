@@ -100,6 +100,76 @@ int bthread_start_background(bthread_t* tid, ...) {
 1. **任务优先级分离**：通过队列插入位置（头/尾）区分紧急任务与普通任务。  
 2. **无锁与有锁结合**：本地队列用无锁结构减少竞争，远程队列用锁保证安全但分散竞争点。  
 3. **延迟唤醒机制**：通过 `ParkingLot` 和 `NOSIGNAL` 标志减少不必要的线程唤醒。  
-4. **上下文切换优化**：汇编级实现栈切换，复用栈内存降低开销[8](@ref)[40](@ref)[68](@ref)。  
+4. **上下文切换优化**：汇编级实现栈切换，复用栈内存降低开销[8](@ref)[40](@ref)[68](@ref)。
+
+
+### **bRPC ParkingLot与Worker同步机制深度解析**
+
+在bRPC的bthread设计中，**ParkingLot**是实现Worker间任务同步的核心组件，通过结合**futex**系统调用和原子操作，实现了高效的线程唤醒与阻塞机制。以下从设计原理、生产-消费流程、底层机制三个层面展开分析：
+
+---
+
+### **一、ParkingLot的设计与作用**
+#### 1. **核心结构**
+- **原子变量 `_pending_signal`**：高31位用于任务计数，最低位标记停止状态[1](@ref)[66](@ref)。通过位操作实现状态分离，避免锁竞争。
+- **分组策略**：每个`TaskControl`维护4个ParkingLot实例，Worker通过哈希线程ID选择对应的ParkingLot，将全局竞争分散到多个实例，减少锁冲突[1](@ref)[55](@ref)。
+- **状态管理**：`TaskGroup`通过`_last_pl_state`缓存ParkingLot的最近状态，用于判断是否需要唤醒[1](@ref)[66](@ref)。
+
+#### 2. **关键操作**
+- **`signal(int num_task)`**：  
+  通过`futex_wake_private`唤醒最多`num_task`个Worker，同时原子递增`_pending_signal`（`num_task << 1`），保持偶数避免误判停止状态[66](@ref)[31](@ref)。
+- **`wait(State expected_state)`**：  
+  使用`futex_wait_private`阻塞Worker，直到`_pending_signal`值与`expected_state`不匹配，触发窃取任务逻辑[55](@ref)[66](@ref)。
+- **`stop()`**：  
+  原子或操作设置最低位为1，唤醒所有Worker，用于全局停止（如`bthread_stop_world()`）[66](@ref)[61](@ref)。
+
+---
+
+### **二、生产者-消费者流程**
+#### 1. **任务生产**
+- **本地任务（Worker提交）**：  
+  通过`TaskGroup::ready_to_run()`将任务推入本地无锁队列`_rq`，若未设置`BTHREAD_NOSIGNAL`，调用`TaskControl::signal_task()`唤醒Worker[47](@ref)[35](@ref)。
+- **远程任务（非Worker提交）**：  
+  使用`TaskGroup::ready_to_run_remote()`将任务插入`_remote_rq`（有锁队列），通过`flush_nosignal_tasks_remote_locked()`处理队列满的情况，最终触发`signal_task()`[1](@ref)[47](@ref)。
+
+#### 2. **任务消费**
+- **Worker主循环**：  
+  通过`TaskGroup::wait_task()`进入阻塞，调用`ParkingLot::wait()`等待任务。若`_pending_signal`状态变化（生产者触发`signal`），唤醒后执行`steal_task()`窃取其他Worker的任务[55](@ref)[47](@ref)。
+- **窃取逻辑**：  
+  优先从`_remote_rq`弹出任务，失败后调用`TaskControl::steal_task()`随机选择其他Worker的队列窃取，结合`WorkStealingQueue`的无锁设计降低竞争[47](@ref)[66](@ref)。
+
+#### 3. **信号控制优化**
+- **`signal_task()`的流量控制**：  
+  限制每次唤醒的Worker数量（最大2个），避免高频唤醒导致性能下降。若任务积压且并发度不足，动态增加Worker线程（`add_workers()`）[1](@ref)[35](@ref)。
+- **`BTHREAD_NOSIGNAL`标志**：  
+  允许批量任务提交时关闭信号通知，减少锁竞争，通过`bthread_flush()`统一唤醒[47](@ref)[35](@ref)。
+
+---
+
+### **三、底层同步机制**
+#### 1. **futex的高效实现**
+- **混合态同步**：  
+  `futex_wake_private`和`futex_wait_private`封装了Linux的`SYS_futex`系统调用，无竞争时完全在用户态操作，避免内核切换开销[31](@ref)[55](@ref)。
+- **参数语义**：  
+  - `FUTEX_WAKE`：唤醒指定数量的阻塞线程，返回实际唤醒数[31](@ref)。  
+  - `FUTEX_WAIT`：仅在`_pending_signal`值与预期一致时阻塞，否则立即返回[66](@ref)[31](@ref)。
+
+#### 2. **性能优化策略**
+- **减少原子操作**：  
+  `_pending_signal`的原子递增仅在生产侧触发，消费侧通过状态缓存（`_last_pl_state`）减少读取[1](@ref)[66](@ref)。
+- **负载均衡**：  
+  4个ParkingLot实例分散Worker的唤醒压力，避免单一队列成为瓶颈[1](@ref)[55](@ref)。
+- **延迟唤醒**：  
+  通过`num_task`限制和动态扩缩容策略，平衡任务处理及时性与CPU利用率[35](@ref)[66](@ref)。
+
+---
+
+### **四、总结**
+bRPC通过**ParkingLot**实现了高效的Worker间任务同步，核心优势在于：
+1. **低竞争设计**：分组ParkingLot与无锁队列减少全局锁依赖。
+2. **精准唤醒**：基于futex的混合态同步，最小化内核切换。
+3. **动态扩缩容**：按需调整Worker数量，适应负载变化。
+
+这种设计在高并发场景下显著提升了任务调度效率，使得bthread在百万级QPS的服务中仍能保持低延迟[44](@ref)[47](@ref)。
 
 这些机制共同支撑了 bthread 在百万级并发下的高性能表现，同时保持了用户代码的同步编程友好性。
