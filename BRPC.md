@@ -256,3 +256,93 @@ Worker3 [PL1]
 ```
 
 通过此例可见，bthread通过**无锁队列+有锁队列混合**、**ParkingLot分散唤醒**及**Work Stealing**实现高并发，同时通过优先级和队列设计优化实时性 [2](@ref)[43](@ref)[84](@ref)。
+
+
+### BRPC 零拷贝
+BRPC（Baidu-RPC）的高性能零拷贝技术核心体现在其**非连续缓冲结构 IOBuf** 的设计中，该结构通过引用计数、内存块复用和协议栈优化，大幅减少了数据在用户态与内核态之间的拷贝次数。以下结合源码和架构设计进行详细解析：
+
+---
+
+### 一、IOBuf 的核心结构
+#### 1. **Block 内存块**
+BRPC 将内存划分为固定大小的 **Block（默认 8KB）**，每个 Block 包含引用计数和容量信息：
+```cpp
+// 源码：brpc/src/iobuf.cpp
+struct IOBuf::Block {
+    butil::atomic<int> nshared;  // 引用计数
+    uint16_t size;              // 已用空间
+    uint16_t cap;               // 总容量
+    Block* portal_next;         // 链表指针
+    char data[0];               // 实际数据（柔性数组）
+};
+```
+- **零拷贝原理**：Block 的 `data` 字段是柔性数组，实际内存分配在 Block 对象之后，允许直接操作原始内存地址，避免数据复制。
+- **引用计数**：通过 `nshared` 实现多线程安全的内存复用，当引用计数归零时自动回收 Block。
+
+#### 2. **BlockRef 引用切片**
+每个 IOBuf 由多个 **BlockRef** 组成，每个 BlockRef 指向 Block 中的一段数据区域：
+```cpp
+struct BlockRef {
+    uint32_t offset;  // 数据在 Block 中的偏移量
+    uint32_t length;  // 数据长度
+    Block* block;     // 指向对应的 Block
+};
+```
+- **非连续存储**：IOBuf 通过 BlockRef 链表管理数据，数据可能分散在多个 Block 中，但逻辑上连续。
+- **零拷贝操作**：合并或拆分 IOBuf 时，仅操作 BlockRef 的引用关系，不复制实际数据（如 `append` 函数直接添加 BlockRef）[2](@ref)[51](@ref)。
+
+---
+
+### 二、零拷贝技术的实现场景
+#### 1. **协议解析与序列化**
+- **直接引用网络缓冲区**：当从 Socket 读取数据时，BRPC 直接将接收缓冲区的 Block 挂载到 IOBuf，无需拷贝到用户态。
+- **Protobuf 序列化**：通过 `IOBufAsZeroCopyInputStream` 和 `IOBufAsZeroCopyOutputStream`，Protobuf 直接操作 IOBuf 的 Block 内存，避免中间拷贝[51](@ref)[2](@ref)。
+
+#### 2. **网络发送优化**
+- **零拷贝发送**：调用 `write` 发送数据时，IOBuf 的 BlockRef 直接传递给内核的 `sendmsg` 系统调用，利用 **scatter-gather DMA** 技术将分散的 Block 一次性发送[10](@ref)[32](@ref)。
+- **减少上下文切换**：通过合并多个小数据包为单个 IOBuf，减少系统调用次数[35](@ref)。
+
+#### 3. **文件传输与附件处理**
+- **sendfile 系统调用**：BRPC 在传输大文件时，通过 `sendfile` 直接将文件内容从磁盘 DMA 缓冲区发送到网络，绕过用户态[50](@ref)[15](@ref)。
+- **附件（Attachment）传递**：HTTP Body 或 RPC 附件以 IOBuf 形式传递，跨服务调用时仅传递 Block 引用，无需数据复制[63](@ref)。
+
+---
+
+### 三、性能优势与源码验证
+#### 1. **高性能合并操作**
+```cpp
+// 源码：brpc/iobuf.cpp
+void IOBuf::append(const IOBuf& other) {
+    for (size_t i = 0; i < other._ref_num(); ++i) {
+        _push_back_ref(other._ref_at(i));  // 仅添加 BlockRef，不复制数据
+    }
+}
+```
+- **合并效率**：合并两个 IOBuf 的时间复杂度为 O(1)，仅操作 BlockRef 链表。
+
+#### 2. **内存池与 TLS 优化**
+- **线程局部存储（TLS）**：每个线程缓存空闲 Block，通过 `iobuf::share_tls_block()` 快速分配，减少锁竞争[2](@ref)[35](@ref)。
+- **对象池技术**：频繁使用的 Block 和 BlockRef 通过池化复用，降低内存碎片化[2](@ref)。
+
+#### 3. **协议栈集成**
+BRPC 的协议处理层（如 HTTP/Redis）直接解析 IOBuf 的原始内存，例如：
+```cpp
+// 伪代码：HTTP 头部解析
+IOBufAsZeroCopyInputStream wrapper(&iobuf);
+ParseHttpHeader(wrapper);  // 直接读取 Block 内存
+```
+
+---
+
+### 四、与传统方案的对比
+| **维度**       | **传统方案（如 std::string）**       | **BRPC IOBuf**                      |
+|----------------|-------------------------------------|-------------------------------------|
+| **内存拷贝**   | 多次数据复制（用户态↔内核态）         | 零拷贝，仅操作内存引用               |
+| **并发性能**   | 锁竞争频繁，内存分配开销大            | 无锁设计，TLS 内存池优化             |
+| **大文件传输** | 需将文件加载到用户态缓冲区            | 直接通过 DMA 和 sendfile 发送        |
+| **灵活性**     | 数据必须连续存储                      | 支持非连续存储，适应流式数据场景      |
+
+---
+
+### 五、总结
+BRPC 的零拷贝技术通过 **IOBuf 的非连续内存管理**、**Block 引用计数**和 **协议栈深度优化**，实现了高效的数据传输。其核心思想是 **减少数据移动** 和 **最大化内存复用**，尤其在高并发、大流量场景下，性能优势显著。源码中的 `Block`、`BlockRef` 和 `IOBufAsZeroCopyStream` 等结构是这一技术的直接体现[2](@ref)[10](@ref)[51](@ref)。
