@@ -144,3 +144,187 @@ Block 0 (16B Slab):
 - **`_blocks`**：统一管理所有大块内存，解决内存分配和地址编码问题。
 - **`_slabs`**：按内存大小分类管理分配策略，提高内存利用率。
 - **malloc/free**：通过空闲链表和 Block 分配策略实现高效内存复用。
+
+# HASHMAP
+我将从源码角度详细解析 `HashMap` 的实现，并展开其调用的核心函数。以下以 **插入（insert）** 操作为主线，串联关键函数调用关系。
+
+---
+
+### 一、数据结构关系图
+```plaintext
++----------------+       +----------------+       +----------------+
+|   HashMap      |       |   LinkList     |       |   DataPool     |
+|----------------|       |----------------|       |----------------|
+| - _p_hash[]    | ----> | - _p_head      | ----> | - malloc()     |
+| - _p_pool      |       | - _p_pool      |       | - free()       |
+| - _hash_size   |       +----------------+       | - read()       |
++----------------+                               +----------------+
+```
+
+---
+
+### 二、核心函数调用链（以`insert`为例）
+```plaintext
+HashMap::insert()
+│
+├── hash_entry()              // 计算哈希桶索引
+│
+├── TList::_load()           // 加载对应桶的链表
+│   ├── DataPool::read()     // 读取链表头节点地址
+│
+├── TList::insert()          // 向链表插入数据
+│   ├── find_insert_pos()    // 查找插入位置
+│   │   ├── real_address()   // 虚拟地址转真实地址
+│   │   └── TCmp::sort_op()  // 比较节点数据
+│   │
+│   ├── malloc_node()        // 分配新节点内存
+│   │   └── DataPool::malloc() 
+│   │
+│   ├── set_data()           // 写入数据到节点
+│   │   └── memcpy()         // 内存拷贝
+│   │
+│   └── set_next()           // 调整链表指针
+│
+├── TList::_unload()         // 卸载链表（仅存储头节点地址）
+│
+└── DataPool::write()        // 可选：持久化数据到存储
+```
+
+---
+
+### 三、关键函数源码解析
+
+#### 1. `HashMap::create()` - 初始化哈希表
+```cpp
+template <typename TSchema>
+int HashMap<TSchema>::create(uint32_t item_num, float hash_ratio, TDataPool* p_pool) {
+    // 选择素数作为桶大小
+    _hash_size = hash_size(item_num, hash_ratio); 
+    // 分配桶数组内存
+    _p_hash = new typename TDataPool::TVaddr[_hash_size]; 
+    // 初始化每个桶为空链表
+    for (uint32_t i = 0; i < _hash_size; ++i) {
+        _p_hash[i] = TDataPool::null();
+    }
+    _p_pool = p_pool; // 关联内存池
+    return 0;
+}
+```
+- **关键点**：使用素数桶减少哈希冲突，依赖 `TDataPool::null()` 表示空指针。
+
+---
+
+#### 2. `HashMap::insert()` - 插入数据
+```cpp
+template <typename TSchema>
+int HashMap<TSchema>::insert(const TTuple& tuple, typename TDataPool::TVaddr* vaddr) {
+    uint32_t bucket = hash_entry(tuple.primary_key()); // 计算桶索引
+    TList list;
+    list._load(_p_hash[bucket], _p_pool); // 加载链表
+    
+    int ret = list.insert(tuple, true, vaddr); // 插入排序
+    if (ret >= 0) ++_node_num;
+    
+    _p_hash[bucket] = list._head(); // 更新桶头节点
+    list._unload();
+    return ret;
+}
+```
+- **关键调用**：`TList::insert()` 实现排序插入。
+
+---
+
+#### 3. `TList::insert()` - 链表插入
+```cpp
+template <class T, class TCmp, class TDataPool>
+int LinkList<T, TCmp, TDataPool>::insert(const T& value, bool need_sort, TVaddr* vaddr) {
+    if (!need_sort) return insert_head(value, vaddr); // 头部插入
+    
+    ListNode* prev_node = nullptr;
+    find_insert_pos(value, prev_node); // 查找插入位置
+    
+    return insert_after(value, prev_node, vaddr); // 插入到prev_node后
+}
+```
+- **排序逻辑**：通过 `TCmp::sort_op` 确定节点顺序。
+
+---
+
+#### 4. `find_insert_pos()` - 查找插入位置
+```cpp
+template <class T, class TCmp, class TDataPool>
+int LinkList<T, TCmp, TDataPool>::find_insert_pos(const T& value, ListNode*& prev_node) const {
+    TVaddr cur = _p_head;
+    while (cur != TDataPool::null()) {
+        ListNode* cur_node = real_address(cur); // 虚拟地址转真实地址
+        if (TCmp::sort_op(cur_node->data(), value)) { // 比较
+            prev_node = cur_node;
+            cur = cur_node->next();
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+```
+- **虚拟地址转换**：`real_address()` 调用 `DataPool::read()` 获取真实内存指针。
+
+---
+
+#### 5. `DataPool::malloc()` - 内存分配
+```cpp
+template <typename TPool>
+typename DataPool<TPool>::TVaddr DataPool<TPool>::malloc(size_t size) {
+    return _p_pool->malloc(size); // 委托给具体内存池实现
+}
+```
+- **实际行为**：由 `TPool`（如 `MemPool`）实现具体的内存分配策略。
+
+---
+
+### 四、示例：插入操作的完整流程
+假设插入数据 `TTuple{id=5}`，哈希桶索引为 `2`：
+1. **加载链表**：通过 `list._load(_p_hash[2], _p_pool)` 加载桶2的链表。
+2. **查找位置**：遍历链表，找到第一个不小于5的节点位置。
+3. **分配节点**：调用 `DataPool::malloc(node_size)` 分配新节点内存。
+4. **写入数据**：`memcpy` 将数据拷贝到节点内存。
+5. **调整指针**：将新节点的 `_next` 指向后续节点，前驱节点指向新节点。
+6. **更新桶头**：将链表的新头节点地址写回 `_p_hash[2]`。
+
+---
+
+### 五、关键设计思想总结
+
+1. **虚拟地址（TVaddr）**  
+   - 抽象物理内存地址，使数据存储可扩展（如支持磁盘存储）。
+   - 通过 `DataPool::read()` 和 `DataPool::malloc()` 实现地址转换。
+
+2. **内存池（DataPool）**  
+   - 统一管理内存分配/释放，减少碎片。
+   - 支持 `malloc`、`free`、`read`、`write` 等基础操作。
+
+3. **排序链表（LinkList）**  
+   - 插入时保持有序，优化查询效率。
+   - 通过模板参数 `TCmp` 实现灵活的比较逻辑。
+
+4. **素数哈希桶**  
+   - 使用预定义的素数表选择桶大小，降低冲突概率。
+   - 提供 `PRIME_LIST` 和 `REFINED_PRIME_LIST` 两种策略。
+
+---
+
+### 六、性能优化点
+
+1. **缓存友好性**  
+   - `ListNode` 将 `_next` 置于结构体头部，提升CPU缓存命中率。
+   - 使用 `_mm_prefetch` 预取下一节点数据。
+
+2. **批量操作**  
+   - `DataPool::writev` 支持批量写入，减少I/O次数。
+
+3. **延迟释放**  
+   - `free` 操作将节点加入 `_dirty_nodes`，由 `recycle` 统一释放，减少锁竞争。
+
+---
+
+通过此解析，可以清晰看到从 `HashMap` 的插入操作到底层内存分配的全链路实现，理解其如何通过组合 `LinkList` 和 `DataPool` 实现高效、灵活的数据存储。
