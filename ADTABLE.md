@@ -328,3 +328,70 @@ typename DataPool<TPool>::TVaddr DataPool<TPool>::malloc(size_t size) {
 ---
 
 通过此解析，可以清晰看到从 `HashMap` 的插入操作到底层内存分配的全链路实现，理解其如何通过组合 `LinkList` 和 `DataPool` 实现高效、灵活的数据存储。
+
+简单示例：
+```
+#include <iostream>
+#include "bsl/string.h"
+#include "HashMap.h"
+
+// 定义一个简单的Schema
+struct Schema {
+    typedef int TPrimaryKey;
+    typedef std::pair<int, std::string> TTuple;
+    typedef std::less<int> TCmp;
+    typedef DataPool<DefaultPool> TDataPool;
+
+    static uint64_t hash_value(const TPrimaryKey& pk) {
+        return std::hash<int>()(pk);
+    }
+};
+
+int main() {
+    // 创建HashMap实例
+    HashMap<Schema> hashmap("example_map");
+
+    // 创建数据池
+    Schema::TDataPool data_pool("example_pool");
+    if (data_pool.create(new DefaultPool())) {
+        std::cerr << "Failed to create data pool" << std::endl;
+        return 1;
+    }
+
+    // 创建HashMap
+    if (hashmap.create(10, 0.75, &data_pool)) {
+        std::cerr << "Failed to create hash map" << std::endl;
+        return 1;
+    }
+
+    // 插入数据
+    Schema::TTuple tuple1(1, "value1");
+    Schema::TTuple tuple2(2, "value2");
+    if (hashmap.insert(tuple1) != 0 || hashmap.insert(tuple2) != 0) {
+        std::cerr << "Failed to insert tuples" << std::endl;
+        return 1;
+    }
+
+    // 查找数据
+    Schema::TPrimaryKey pk1 = 1;
+    auto iter = hashmap.seek(pk1);
+    if (!iter.is_null()) {
+        std::cout << "Found tuple: " << iter->first << ", " << iter->second << std::endl;
+    } else {
+        std::cerr << "Tuple not found" << std::endl;
+    }
+
+    // 移除数据
+    hashmap.remove(pk1);
+
+    // 再次查找数据
+    iter = hashmap.seek(pk1);
+    if (iter.is_null()) {
+        std::cout << "Tuple removed successfully" << std::endl;
+    } else {
+        std::cerr << "Failed to remove tuple" << std::endl;
+    }
+
+    return 0;
+}
+```
