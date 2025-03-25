@@ -395,3 +395,155 @@ int main() {
     return 0;
 }
 ```
+
+# DATAPOOL
+
+### DataPool 源码解析
+
+#### **核心设计目标**
+`DataPool` 是内存池的 **高级封装模板类**，用于统一管理不同底层内存池（如 `SlabMempool32`）的 **内存分配、释放、监控**，并支持 **延迟回收** 机制。其核心职责是：
+1. **抽象内存池接口**：封装底层内存池的 `malloc`、`free` 等操作。
+2. **批量回收优化**：通过 `_dirty_nodes` 暂存待释放地址，减少频繁释放的开销。
+3. **监控与统计**：收集内存池的使用指标（如内存消耗、节点数量）。
+
+---
+
+#### **关键代码解析**
+
+##### **1. 类定义与成员变量**
+```cpp
+template <typename TPool>
+class DataPool {
+    TPool* _p_pool;            // 底层内存池实例（如 SlabMempool32）
+    bsl::string _name;         // 内存池名称（用于监控标识）
+    std::vector<TVaddr> _dirty_nodes; // 延迟释放的虚拟地址列表
+};
+```
+- **`TPool`**：模板参数，需实现 `IDataPool` 接口（如 `malloc`、`free`）。
+- **`_dirty_nodes`**：延迟释放队列，避免高频 `free` 操作影响性能。
+
+---
+
+##### **2. 核心方法实现**
+###### **初始化与销毁**
+```cpp
+int create(TPool* p_pool) {
+    if (!p_pool) return -1;
+    _p_pool = p_pool; // 绑定底层内存池
+    return 0;
+}
+
+void recycle() {
+    for (auto vaddr : _dirty_nodes) {
+        _p_pool->free(vaddr); // 批量释放内存
+    }
+    _dirty_nodes.clear();
+}
+```
+- **延迟释放**：调用 `free` 仅标记地址，`recycle` 时统一释放。
+
+---
+
+###### **内存分配与释放**
+```cpp
+TVaddr malloc(size_t size) {
+    return _p_pool->malloc(size); // 委托底层池分配
+}
+
+void free(const TVaddr& vaddr) {
+    _dirty_nodes.push_back(vaddr); // 加入延迟释放队列
+}
+```
+- **分配代理**：直接调用底层池的 `malloc`。
+- **延迟释放**：释放操作被推迟到 `recycle`，减少锁竞争和碎片化。
+
+---
+
+###### **数据读写**
+```cpp
+const void* read(const TVaddr& vaddr) const {
+    const char* p_obj = NULL;
+    _p_pool->read(vaddr, p_obj); // 读取物理地址
+    return p_obj;
+}
+
+int write(const TVaddr& vaddr, const Buffer& buf) {
+    return _p_pool->write(vaddr, buf); // 写入数据
+}
+```
+- **直接转发**：读写操作透传到底层内存池。
+
+---
+
+###### **对象序列化**
+```cpp
+template <class TObj>
+const TObj* read_object(const TVaddr& vaddr) const {
+    return static_cast<const TObj*>(read(vaddr)); // 反序列化对象
+}
+
+template <class TObj>
+int write_object(const TVaddr& vaddr, const TObj& obj) {
+    Buffer buf(reinterpret_cast<const char*>(&obj), sizeof(TObj));
+    return write(vaddr, buf); // 序列化对象
+}
+```
+- **类型安全**：通过模板将对象转换为二进制缓冲区。
+
+---
+
+##### **监控与统计**
+```cpp
+void monitor(bsl::var::Dict& dict, bsl::ResourcePool& rp) const {
+    bsl::var::Dict& inner_dict = rp.create<bsl::var::Dict>();
+    _p_pool->monitor(inner_dict, rp); // 收集底层池指标
+    dict["NAME"] = rp.create<bsl::var::String>(_name);
+    dict["INNER_POOL"] = inner_dict; // 汇总到外层字典
+}
+```
+- **指标聚合**：将底层池的监控数据（如内存消耗、节点数）整合到统一字典。
+
+---
+
+#### **设计亮点**
+1. **延迟释放优化**  
+   - **减少锁竞争**：批量释放降低多线程环境下的锁争用。
+   - **提升性能**：避免频繁调用底层 `free` 的系统开销。
+
+2. **统一接口抽象**  
+   - **适配多种内存池**：通过模板参数 `TPool` 支持不同实现（如 `SlabMempool32`、`BuddyPool`）。
+
+3. **监控集成**  
+   - **层级化统计**：通过 `monitor` 方法汇总内存池状态，便于系统级资源分析。
+
+---
+
+#### **使用示例**
+##### **场景**：广告系统的标题存储
+```cpp
+// 1. 初始化内存池
+SlabMempool32 slab_pool;
+DataPool<SlabMempool32> title_pool("title_pool");
+title_pool.create(&slab_pool);
+
+// 2. 分配内存并写入数据
+const char* title = "夏季大促销";
+Buffer buf(title, strlen(title));
+TVaddr vaddr = title_pool.malloc(buf.size());
+title_pool.write(vaddr, buf);
+
+// 3. 读取数据
+const char* stored_title = static_cast<const char*>(title_pool.read(vaddr));
+std::cout << "标题: " << stored_title << std::endl;
+
+// 4. 标记释放（延迟到 recycle）
+title_pool.free(vaddr);
+
+// 5. 批量回收
+title_pool.recycle();
+```
+
+---
+
+#### **总结**
+`DataPool` 通过 **模板封装** 和 **延迟释放机制**，为内存池提供了高效、易用的管理接口。其设计适用于需要高频内存操作且关注性能监控的系统（如广告检索、实时计算），是构建高性能C++中间件的关键组件。
