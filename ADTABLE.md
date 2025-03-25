@@ -695,3 +695,228 @@ std::cout << "Pool Status: " << monitor_data.to_json() << std::endl;
 
 4. **性能权衡**  
    - 延迟释放提升性能，但可能导致内存峰值升高，需根据场景调整 `recycle()` 调用频率。
+
+# MemDataTable
+
+### 源码解析：MemDataTable（基于 DataPool 的内存数据表）
+
+#### 一、核心设计思想
+**MemDataTable** 是基于 **DataPool** 实现的 **内存正排表**，负责结构化数据的存储与管理。其核心特点：
+- **哈希索引**：通过 `THashMap` 实现主键快速查找，索引数据存储在 **DataPool** 中。
+- **内存池分层**：分 **固定字段池**（`_p_hash_pool`）和 **变长字段池**（`_p_var_pools`），均由 `DataPool` 管理。
+- **延迟释放**：利用 `DataPool::free` 的延迟回收机制优化高频更新场景性能。
+
+---
+
+#### 二、关键源码解析（结合 DataPool）
+
+##### 1. **创建内存池与哈希表（`create`）**
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::create(uint32_t row_num, float hash_ratio, const AdTableBaseEnv* adtable_ctx) {
+    // 1. 创建哈希表（THashMap）及其底层 DataPool
+    if (create_dict(row_num, hash_ratio) < 0) { /* 错误处理 */ }
+
+    // 2. 创建变长字段的 DataPool 数组
+    if (create_data_pool() < 0) { /* 错误处理 */ }
+
+    return 0;
+}
+
+// 创建哈希表及其 DataPool
+template <typename TSchema>
+int MemDataTable<TSchema>::create_dict(uint32_t row_num, float hash_ratio) {
+    // 初始化底层内存池 SlabMempool32
+    _p_hash_inner_pool = new SlabMempool32();
+    _p_hash_inner_pool->create(slabs, 2, 1024 * 1024); // 预定义块大小
+
+    // 创建 DataPool 封装
+    _p_hash_pool = new DataPool<SlabMempool32>(name);
+    _p_hash_pool->create(_p_hash_inner_pool); // 绑定底层池
+
+    // 初始化哈希表 THashMap
+    _p_dict = new THashMap(name);
+    _p_dict->create(row_num, hash_ratio, _p_hash_pool); // 使用 DataPool
+}
+
+// 创建变长字段池
+template <typename TSchema>
+int MemDataTable<TSchema>::create_data_pool() {
+    for (size_t i = 0; i < TSchema::VAR_POOL_NUM; ++i) {
+        // 每个变长字段独立 DataPool
+        _p_inner_pools[i] = new TInnerPool();
+        _p_var_pools[i] = new DataPool<TInnerPool>(pool_name);
+        _p_var_pools[i]->create(_p_inner_pools[i]);
+    }
+}
+```
+- **关键点**：为哈希表和变长字段分别初始化 `DataPool`，实现内存隔离管理。
+
+---
+
+##### 2. **插入数据（`insert`）**
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::insert(const TDataTuple& tuple) {
+    // 1. 转换数据格式（固定+变长字段）
+    TInnerTuple inner_tuple;
+    DataTable<TSchema>::make_inner_tuple(tuple, &inner_tuple);
+
+    // 2. 为变长字段分配内存（通过 DataPool）
+    if (insert_var_pools(inner_tuple, tuple) < 0) { /* 错误处理 */ }
+
+    // 3. 插入哈希表（触发 DataPool::malloc）
+    TVaddr vaddr;
+    int ret = _p_dict->insert(inner_tuple, &vaddr); // 内部调用 _p_hash_pool->malloc()
+
+    // 4. 记录虚拟地址到数据元信息
+    const_cast<TDataTuple&>(tuple)._set_vaddr(vaddr);
+}
+```
+
+**`insert_var_pools`（变长字段分配）**
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::insert_var_pools(TInnerTuple& inner_tuple, const TDataTuple& tuple) {
+    for (size_t pool_idx = 0; pool_idx < TSchema::VAR_POOL_NUM; ++pool_idx) {
+        // 分配变长字段内存（如字符串）
+        TVaddr var_addr = _p_var_pools[pool_idx]->malloc(tuple.var_size(pool_idx));
+        
+        // 将数据写入 DataPool
+        Buffer buf(tuple.var_data(pool_idx), tuple.var_size(pool_idx));
+        _p_var_pools[pool_idx]->write(var_addr, buf);
+
+        // 记录虚拟地址到 inner_tuple
+        inner_tuple.set_var_addr(pool_idx, var_addr);
+    }
+}
+```
+- **关键点**：每个变长字段通过独立的 `DataPool` 分配内存，写入后记录虚拟地址。
+
+---
+
+##### 3. **删除数据（`remove`）**
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::remove(const TPrimaryKey& pk) {
+    // 1. 查找数据
+    Iterator iter = seek(pk);
+    if (iter.is_null()) return -1;
+
+    // 2. 释放变长字段内存（通过 DataPool::free）
+    remove_var_pools(*iter, pk);
+
+    // 3. 从哈希表删除（触发 DataPool::free 延迟回收）
+    _p_dict->remove(pk); // 内部调用 _p_hash_pool->free()
+}
+
+// 释放变长字段内存
+template <typename TSchema>
+void MemDataTable<TSchema>::remove_var_pools(...) {
+    for (size_t pool_idx = 0; pool_idx < TSchema::VAR_POOL_NUM; ++pool_idx) {
+        _p_var_pools[pool_idx]->free(data._var_ptr(pool_idx)); // 标记释放
+    }
+}
+```
+- **关键点**：删除操作仅标记内存为脏数据，由 `recycle()` 统一回收。
+
+---
+
+##### 4. **内存回收（`recycle`）**
+```cpp
+template <typename TSchema>
+void MemDataTable<TSchema>::recycle() {
+    _p_hash_pool->recycle(); // 批量释放哈希表脏内存
+    for (auto pool : _p_var_pools) {
+        pool->recycle(); // 释放变长字段脏内存
+    }
+}
+```
+- **机制**：调用各 `DataPool` 的 `recycle()`，实际执行底层池的 `free`。
+
+---
+
+##### 5. **监控（`monitor`）**
+```cpp
+template <typename TSchema>
+void MemDataTable<TSchema>::monitor(bsl::var::Dict& dict, bsl::ResourcePool& rp) const {
+    // 1. 收集哈希表内存信息
+    _p_dict->monitor(dict, rp); // 内部调用 _p_hash_pool->monitor()
+
+    // 2. 收集变长字段池信息
+    for (auto pool : _p_var_pools) {
+        pool->monitor(var_dict, rp); // 各 DataPool 独立上报
+    }
+}
+```
+
+---
+
+#### 三、使用示例
+
+##### 1. **定义 Schema**
+```cpp
+// 定义用户表结构
+struct UserSchema {
+    using TPrimaryKey = int; // 用户ID为主键
+    using TDataTuple = User; // 数据行类型
+
+    struct User {
+        int id;
+        std::string name; // 变长字段
+    };
+
+    enum { VAR_POOL_NUM = 1 }; // 一个变长字段（name）
+};
+```
+
+##### 2. **初始化 MemDataTable**
+```cpp
+MemDataTable<UserSchema> user_table("user");
+user_table.create(1000000, 1.5f, &env); // 预期100万行，负载因子1.5
+```
+
+##### 3. **插入数据**
+```cpp
+User user;
+user.id = 1001;
+user.name = "Alice";
+user_table.insert(user); // 触发 DataPool 分配
+```
+
+##### 4. **查询数据**
+```cpp
+auto iter = user_table.seek(1001);
+if (!iter.is_null()) {
+    std::cout << "User Name: " << iter->name << std::endl;
+}
+```
+
+##### 5. **删除数据**
+```cpp
+user_table.remove(1001); // 标记内存待回收
+user_table.recycle();    // 实际释放内存
+```
+
+##### 6. **监控状态**
+```cpp
+bsl::var::Dict stats;
+user_table.monitor(stats);
+std::cout << "Memory Used: " << stats["MEM_CONSUME"] << " bytes" << std::endl;
+```
+
+---
+
+#### 四、性能优化点
+
+1. **批量回收**  
+   - 高频删除场景下，避免单次 `free` 调用，利用 `recycle()` 批量释放。
+
+2. **内存池调优**  
+   - 根据数据大小调整 `SlabMempool32` 的块尺寸，减少内部碎片。
+
+3. **哈希负载监控**  
+   - 定期检查 `HASH_RATIO_PERCENT`，过高时需扩容哈希表（重建 `THashMap`）。
+
+4. **预分配内存**  
+   - 初始化时预估行数，调用 `DataPool::malloc` 预分配大块内存。
