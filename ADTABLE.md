@@ -1130,3 +1130,334 @@ plan_table.recycle(); // 调用 DataPool::recycle() 批量释放标记内存
 - **数据抽象**：使用宏生成数据类，分离读写接口（`DataTuple` vs `DataTupleRef`）。
 - **变长字段**：通过 `VectorVar` 和独立内存池管理，支持动态扩容。
 - **性能优化**：延迟加载、批量回收机制提升高频操作性能。
+
+# 变长字段
+
+### 1. `VectorVar` 概述
+`VectorVar` 是一个模板类，用于处理可变长度的向量数据，它继承自 `VarField` 类，使用 `VectorVarS` 作为其模式定义。下面我们将逐步展开其调用链的每一个环节。
+
+### 2. 代码结构与关键组件
+
+#### 2.1 `Buffer` 类
+`Buffer` 类用于封装一段内存区域，提供了基本的访问和设置方法。
+```cpp
+namespace im {
+namespace adtable {
+
+class Buffer {
+public:
+    Buffer() : _start(NULL), _size(0) {}
+    Buffer(const char* start, uint32_t size) : _start(start), _size(size) {}
+    virtual ~Buffer() {}
+
+    const char* start() const { return _start; }
+    char* mutable_start() const { return const_cast<char*>(_start); }
+    uint32_t size() const { return _size; }
+
+    void set_buffer(const char* buf, uint32_t n_bytes) {
+        _start = buf;
+        _size = n_bytes;
+    }
+
+    template <typename TObj>
+    void set_buffer(const TObj& obj) {
+        _start = (const char*) &obj;
+        _size = sizeof(obj);
+    }
+
+private:
+    const char* _start;
+    uint32_t    _size;
+};
+
+}  // namespace adtable
+}  // namespace im
+```
+这个类主要用于存储和操作一段连续的内存数据，提供了设置和获取内存起始地址和大小的方法。
+
+#### 2.2 `VarField` 类
+`VarField` 是一个模板类，用于处理可变字段，它依赖于一个模式类 `TSchema` 来定义字段的头部、尾部和数据体的处理方式。
+```cpp
+namespace im {
+namespace adtable {
+
+template <typename TSchema>
+class VarField {
+public:
+    typedef typename TSchema::THead THead;
+    typedef typename TSchema::TTail TTail;
+
+    VarField() : _p_body(NULL), _is_valid(false) {}
+    virtual ~VarField() {}
+
+    const THead& head() const { return _head; }
+    const TTail& tail() const { return _tail; }
+    const char* body() const { return _p_body; }
+    bool is_valid() const { return _is_valid; }
+
+    template <typename T>
+    void load(const T& src_data) {
+        TSchema::make_var_field(src_data, &_head, &_tail, &_p_body);
+        _is_valid = TSchema::check(_head, _tail);
+    }
+
+    template <typename TPool>
+    void load(const TPool& pool, const typename TPool::TVaddr& vaddr) {
+        _is_valid = false;
+        if (vaddr == TPool::null()) {
+            _p_body = NULL;
+            _is_valid = true;
+            return;
+        }
+
+        const char* addr = (const char*) pool.read(vaddr);
+        if (addr == NULL) {
+            _p_body = NULL;
+            return;
+        }
+
+        _head = ((const THead*) addr)[0];
+        _p_body = addr + sizeof(THead);
+
+        uint32_t body_size = TSchema::body_size(_head);
+        _tail = ((const TTail*)(addr + sizeof(THead) + body_size))[0];
+
+        _is_valid = TSchema::check(_head, _tail);
+    }
+
+    template <typename TPool>
+    int save(TPool& pool, typename TPool::TVaddr* p_vaddr) const {
+        if (p_vaddr != NULL) {
+            *p_vaddr = TPool::null();
+        }
+
+        if (!is_valid()) {
+            CFATAL_LOG("is_valid() test failed.");
+            return -1;
+        }
+
+        uint32_t body_size = TSchema::body_size(_head);
+        if (_p_body == NULL || body_size == 0) {
+            return 0;
+        }
+
+        uint32_t malloc_size = sizeof(_head) + body_size + sizeof(_tail);
+
+        typename TPool::TVaddr vaddr = pool.malloc(malloc_size);
+        if (vaddr == pool.null()) {
+            CFATAL_LOG(
+                    "Failed to malloc %u bytes from DataPool %s.",
+                    malloc_size, pool.name().c_str());
+            return -1;
+        }
+
+        Buffer data[3];
+        data[0].set_buffer(_head);
+        data[1].set_buffer(_p_body, body_size);
+        data[2].set_buffer(_tail);
+
+        if (pool.writev(vaddr, data, 3) < 0) {
+            CFATAL_LOG(
+                    "Failed to write field into DataPool %s",
+                    pool.name().c_str());
+            return -1;
+        }
+
+        if (p_vaddr != NULL) {
+            *p_vaddr = vaddr;
+        }
+
+        return 0;
+    }
+
+    void load(void* addr) {
+        _is_valid = false;
+
+        if (addr == NULL) {
+            CFATAL_LOG("illegel load addr");
+            _p_body = NULL;
+            return;
+        }
+
+        _head = ((const THead*) addr)[0];
+        _p_body = addr + sizeof(THead);
+
+        uint32_t body_size = TSchema::body_size(_head);
+        _tail = ((const TTail*)(addr + sizeof(THead) + body_size))[0];
+
+        _is_valid = TSchema::check(_head, _tail);
+    }
+
+    int save(void* addr) const {
+        if (addr == NULL) {
+            CFATAL_LOG("illegel save address");
+            return -1;
+        }
+
+        if (!is_valid()) {
+            CFATAL_LOG("is_valid() test failed.");
+            return -1;
+        }
+
+        uint32_t body_size = TSchema::body_size(_head);
+        memcpy(addr, &_head, sizeof(_head));
+        memcpy(addr + sizeof(_head), _p_body, body_size);
+        memcpy(addr + sizeof(_head) + body_size, &_tail, sizeof(_tail));
+
+        return 0;
+    }
+
+    uint32_t total_size() {
+        uint32_t body_size = TSchema::body_size(_head);
+        return sizeof(_head) + body_size + sizeof(_tail);
+    }
+
+protected:
+    THead           _head;
+    const char*     _p_body;
+    TTail           _tail;
+    bool            _is_valid;
+};
+
+}  // namespace adtable
+}  // namespace im
+```
+这个类提供了加载和保存可变字段数据的功能，具体的处理逻辑由 `TSchema` 类定义。
+
+#### 2.3 `VectorVarS` 类
+`VectorVarS` 是一个模板类，作为 `VectorVar` 的模式类，定义了向量数据的头部、尾部和数据体的处理方式。
+```cpp
+namespace im {
+namespace adtable {
+
+template <typename T, int MAX_SIZE>
+class VectorVarS {
+public:
+    typedef uint16_t    THead;
+    typedef uint16_t    TTail;
+
+    static void make_var_field(
+            const Vector<T, MAX_SIZE>& src_data,
+            THead* p_head,
+            TTail* p_tail,
+            const char** p_buf) {
+        *p_head = static_cast<uint16_t>(src_data.size());
+        *p_tail = static_cast<uint16_t>(src_data.size());
+
+        Buffer buf = src_data.raw_buf();
+        *p_buf = buf.start();
+    };
+
+    static bool check(const THead& head, const TTail& tail) {
+        if (head > MAX_SIZE) {
+            return false;   // over flow
+        }
+
+        return (head == tail);
+    }
+
+    static uint32_t body_size(const THead& head) {
+        return head * sizeof(T);
+    }
+};
+
+}  // namespace adtable
+}  // namespace im
+```
+这个类定义了向量数据的头部和尾部的设置方法，以及数据体大小的计算方法，同时提供了数据有效性检查的方法。
+
+#### 2.4 `VectorVar` 类
+`VectorVar` 是一个模板类，继承自 `VarField<VectorVarS<T, MAX_SIZE>>`，用于处理可变长度的向量数据。
+```cpp
+namespace im {
+namespace adtable {
+
+template <typename T, int MAX_SIZE>
+class VectorVar : public VarField<VectorVarS<T, MAX_SIZE> > {
+public:
+    typedef VarField<VectorVarS<T, MAX_SIZE> > TBase;
+
+    uint32_t size() const {
+        if (TBase::body() == NULL || !TBase::is_valid()) {
+            return 0;
+        }
+        return TBase::head();
+    }
+
+    const T& operator[](uint32_t k) const {
+        const char* raw_buf = TBase::body();
+        uint16_t size = TBase::head();
+        if (k >= size) {
+            if (size > 0) {
+                k = size - 1;
+            } else {
+                k = 0;
+            }
+        }
+
+        const T* buf = (const T*) raw_buf;
+        return buf[k];
+    }
+
+};
+
+template <typename T, int MAX_SIZE, typename TOstream>
+TOstream& operator<<(TOstream& os, const VectorVar<T, MAX_SIZE>& vec)
+{
+    if (vec.is_valid()) {
+        uint32_t size = vec.size();
+        os << size << "<";
+        for (uint32_t i = 0; i < size; ++i) {
+            os << vec[i] << "\1";
+        }
+        os << ">";
+    } else {
+        os << "NULL";
+    }
+    return os;
+}
+
+}  // namespace adtable
+}  // namespace im
+```
+这个类提供了获取向量大小和访问向量元素的方法，同时重载了输出运算符，方便输出向量数据。
+
+### 3. 调用链分析
+
+#### 3.1 数据加载
+当调用 `VectorVar` 的 `load` 方法时，会调用 `VarField` 的 `load` 方法，而 `VarField` 的 `load` 方法会调用 `VectorVarS` 的 `make_var_field` 方法来设置头部、尾部和数据体的指针，同时调用 `check` 方法来检查数据的有效性。
+```cpp
+// VectorVar 的 load 方法调用示例
+VectorVar<int, 100> vec;
+Vector<int, 100> src_data;
+// 初始化 src_data...
+vec.load(src_data);
+// 调用链：VectorVar::load -> VarField::load -> VectorVarS::make_var_field -> VectorVarS::check
+```
+
+#### 3.2 数据保存
+当调用 `VectorVar` 的 `save` 方法时，会调用 `VarField` 的 `save` 方法，`VarField` 的 `save` 方法会计算数据体的大小，分配内存，将头部、数据体和尾部数据写入内存池，并返回分配的内存地址。
+```cpp
+// VectorVar 的 save 方法调用示例
+VectorVar<int, 100> vec;
+// 初始化 vec...
+DataPool pool;
+typename DataPool::TVaddr vaddr;
+vec.save(pool, &vaddr);
+// 调用链：VectorVar::save -> VarField::save -> VectorVarS::body_size
+```
+
+#### 3.3 数据访问
+当调用 `VectorVar` 的 `size` 方法时，会调用 `VarField` 的 `body` 和 `head` 方法来获取数据体指针和头部信息，从而计算向量的大小。当调用 `operator[]` 方法时，会根据数据体指针和头部信息来访问向量的元素。
+```cpp
+// VectorVar 的 size 和 operator[] 方法调用示例
+VectorVar<int, 100> vec;
+// 初始化 vec...
+uint32_t size = vec.size();
+int element = vec[0];
+// 调用链：VectorVar::size -> VarField::body -> VarField::head
+// 调用链：VectorVar::operator[] -> VarField::body -> VarField::head
+```
+
+### 4. 总结
+`VectorVar` 类通过继承 `VarField` 类，利用 `VectorVarS` 类作为模式定义，实现了可变长度向量数据的加载、保存和访问功能。其调用链涉及到多个类的方法调用，通过模板类的设计，使得代码具有良好的可扩展性和复用性。
