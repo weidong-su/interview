@@ -1625,3 +1625,221 @@ const T& element = vec[2];
 ```
 
 通过此设计，`VectorVar` 实现了高效的类型安全可变长度向量存储。
+
+### 源码解析：VectorVar（变长向量存储）
+
+---
+
+#### 一、核心组件与设计思想
+
+**VectorVar** 是一个 **支持变长存储的向量模板类**，基于 `VarField` 实现数据的内存序列化与反序列化。其核心设计目标：
+- **动态长度**：允许存储最多 `MAX_SIZE` 个元素，实际长度在运行时确定。
+- **内存安全**：通过 `VarField` 确保数据头尾校验，防止内存越界。
+- **高效存储**：使用连续内存块存储数据，减少碎片。
+
+---
+
+#### 二、关键源码解析
+
+##### 1. **VectorVarS（序列化策略）**
+```cpp
+template <typename T, int MAX_SIZE>
+class VectorVarS {
+public:
+    typedef uint16_t THead; // 头标记（存储元素数量）
+    typedef uint16_t TTail; // 尾标记（校验用）
+
+    static void make_var_field(
+        const Vector<T, MAX_SIZE>& src_data,
+        THead* p_head, TTail* p_tail, 
+        const char** p_buf) 
+    {
+        *p_head = src_data.size(); // 头记录元素数量
+        *p_tail = src_data.size(); // 尾与头相同（校验）
+        *p_buf = src_data.raw_buf().start(); // 数据指针
+    }
+
+    static bool check(THead head, TTail tail) {
+        return (head <= MAX_SIZE) && (head == tail); // 校验数据完整性
+    }
+
+    static uint32_t body_size(THead head) {
+        return head * sizeof(T); // 计算数据部分大小
+    }
+};
+```
+- **作用**：定义数据序列化规则及校验逻辑。
+
+---
+
+##### 2. **VectorVar（主类）**
+```cpp
+template <typename T, int MAX_SIZE>
+class VectorVar : public VarField<VectorVarS<T, MAX_SIZE>> {
+public:
+    typedef VarField<VectorVarS<T, MAX_SIZE>> TBase;
+
+    uint32_t size() const {
+        if (!TBase::is_valid()) return 0;
+        return TBase::head(); // 头标记即为元素数量
+    }
+
+    const T& operator[](uint32_t idx) const {
+        const char* buf = TBase::body(); // 数据起始地址
+        uint16_t size = TBase::head();
+        idx = (idx >= size) ? (size > 0 ? size-1 : 0) : idx; // 边界保护
+        return reinterpret_cast<const T*>(buf)[idx];
+    }
+};
+```
+- **继承**：复用 `VarField` 的加载/保存逻辑。
+- **功能**：提供向量接口（大小、元素访问）。
+
+---
+
+##### 3. **VarField（基础存储类）**
+```cpp
+template <typename TSchema>
+class VarField {
+    TSchema::THead _head;   // 头标记
+    const char* _p_body;    // 数据指针
+    TSchema::TTail _tail;   // 尾标记
+    bool _is_valid;         // 校验结果
+
+public:
+    // 从数据源加载（如Vector<T>）
+    template <typename T>
+    void load(const T& src_data) {
+        TSchema::make_var_field(src_data, &_head, &_tail, &_p_body);
+        _is_valid = TSchema::check(_head, _tail);
+    }
+
+    // 从内存池加载
+    template <typename TPool>
+    void load(const TPool& pool, const typename TPool::TVaddr& vaddr) {
+        const char* addr = (const char*) pool.read(vaddr);
+        _head = *reinterpret_cast<const THead*>(addr);
+        _p_body = addr + sizeof(THead);
+        _tail = *reinterpret_cast<const TTail*>(addr + sizeof(THead) + TSchema::body_size(_head));
+        _is_valid = TSchema::check(_head, _tail);
+    }
+
+    // 保存到内存池
+    template <typename TPool>
+    int save(TPool& pool, typename TPool::TVaddr* p_vaddr) const {
+        uint32_t total_size = sizeof(THead) + TSchema::body_size(_head) + sizeof(TTail);
+        typename TPool::TVaddr vaddr = pool.malloc(total_size);
+
+        Buffer data[3] = {
+            Buffer(&_head, sizeof(THead)),
+            Buffer(_p_body, TSchema::body_size(_head)),
+            Buffer(&_tail, sizeof(TTail))
+        };
+
+        pool.writev(vaddr, data, 3); // 批量写入
+        *p_vaddr = vaddr;
+        return 0;
+    }
+};
+```
+- **核心方法**：实现数据与内存池的交互。
+
+---
+
+#### 三、调用链示例（插入数据到内存池）
+
+##### 1. **初始化 VectorVar**
+```cpp
+Vector<uint32_t, 128> vec;
+vec.push_back(1);
+vec.push_back(2);
+VectorVar<uint32_t, 128> var_vec;
+var_vec.load(vec); // 调用 VarField::load(const T&)
+```
+- **流程**：
+  1. `VectorVarS::make_var_field` 提取 `vec` 的大小和数据指针。
+  2. 设置 `_head` 和 `_tail` 为 2（元素数量）。
+  3. `_p_body` 指向 `vec` 的原始数据地址。
+
+---
+
+##### 2. **保存到内存池**
+```cpp
+DataPool<SlabMempool32> pool;
+pool.create(...);
+typename DataPool::TVaddr vaddr;
+var_vec.save(pool, &vaddr); // 调用 VarField::save()
+```
+- **流程**：
+  1. 计算总大小：`sizeof(uint16_t) + 2*sizeof(uint32_t) + sizeof(uint16_t) = 2 + 8 + 2 = 12`。
+  2. 从 `pool` 分配 12 字节内存，获得 `vaddr`。
+  3. 分三部分写入内存池：
+     - 头标记（2字节）：0x0002。
+     - 数据体（8字节）：0x00000001, 0x00000002。
+     - 尾标记（2字节）：0x0002。
+
+---
+
+##### 3. **从内存池加载**
+```cpp
+VectorVar<uint32_t, 128> loaded_vec;
+loaded_vec.load(pool, vaddr); // 调用 VarField::load(TPool&)
+uint32_t size = loaded_vec.size(); // 2
+uint32_t elem = loaded_vec[1];     // 2
+```
+- **流程**：
+  1. 从 `vaddr` 读取内存块。
+  2. 解析头标记 `_head=2`，尾标记 `_tail=2`。
+  3. 校验 `_head == _tail` 且 `_head <= 128`。
+  4. `_p_body` 指向数据部分，通过 `operator[]` 访问元素。
+
+---
+
+#### 四、关键设计点
+
+1. **头尾校验**  
+   - 写入时头尾标记相同，加载时校验防止数据损坏。
+
+2. **内存布局**  
+   - 连续存储结构：`[Head][Data...][Tail]`，提升访问效率。
+
+3. **变长支持**  
+   - 实际存储长度由 `_head` 决定，最大不超过 `MAX_SIZE`。
+
+4. **与内存池交互**  
+   - 使用 `DataPool` 分配内存，支持延迟回收（通过 `TVaddr` 虚拟地址）。
+
+---
+
+#### 五、使用示例
+
+```cpp
+// 创建原始数据
+Vector<uint32_t, 128> cities;
+cities.push_back(1001);
+cities.push_back(1002);
+
+// 封装为 VectorVar
+VectorVar<uint32_t, 128> var_cities;
+var_cities.load(cities);
+
+// 保存到内存池
+DataPool<SlabMempool32> pool;
+pool.create(...);
+typename DataPool::TVaddr addr;
+var_cities.save(pool, &addr);
+
+// 从池中加载
+VectorVar<uint32_t, 128> loaded_cities;
+loaded_cities.load(pool, addr);
+cout << loaded_cities.size() << endl; // 输出 2
+cout << loaded_cities[1] << endl;     // 输出 1002
+```
+
+---
+
+#### 六、性能与安全
+
+- **性能优化**：连续内存访问、批量写入（`writev`）减少I/O次数。
+- **安全机制**：边界检查（`operator[]`）、头尾校验防止数据错乱。
+- **内存控制**：通过 `MAX_SIZE` 限制最大内存使用，避免溢出。
