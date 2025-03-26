@@ -920,3 +920,213 @@ std::cout << "Memory Used: " << stats["MEM_CONSUME"] << " bytes" << std::endl;
 
 4. **预分配内存**  
    - 初始化时预估行数，调用 `DataPool::malloc` 预分配大块内存。
+
+# PlanTable
+
+### 源码解析：PlanTable（广告计划表）
+
+---
+
+#### 一、核心结构定义
+
+##### 1. **Schema 定义（PlanTableS）**
+```cpp
+class PlanTableS {
+public:
+    typedef PlanTableInnerTuple   TInnerTuple;  // 内存存储结构
+    typedef PlanTableDataTuple    TDataTuple;   // 外部数据接口
+    typedef Uint32Key             TPrimaryKey;  // 主键类型（uint32_t）
+    typedef SlabMempool32         TInnerPool;   // 内存池类型
+    typedef DataPool<TInnerPool>  TDataPool;    // 内存池封装
+    typedef TInnerPool::TVaddr    TVaddr;       // 虚拟地址类型
+
+    static const char* PRIMARY_KEY_FIELDS;      // 主键字段名（"plan_id"）
+    enum { VAR_POOL_NUM = 1 };                  // 变长字段数量（city_region）
+    
+    // 数据转换方法
+    static void make_inner_tuple(const TDataTuple &tuple, TInnerTuple* inner);
+    static bool is_valid_data_tuple(const TDataTuple &tuple);
+    static void make_data_tuple(const PlanTableDataTupleRef& ref, TDataTuple* tuple);
+};
+```
+- **功能**：定义表结构元信息，包括内存布局、主键、数据校验逻辑。
+
+---
+
+##### 2. **内存存储结构（PlanTableInnerTuple）**
+```cpp
+struct PlanTableInnerTuple {
+    uint32_t plan_id;       // 计划ID（主键）
+    uint64_t region;        // 区域编码
+    TVaddr _var_ptrs[VAR_POOL_NUM]; // 变长字段虚拟地址（city_region）
+
+    TPrimaryKey primary_key() const { return plan_id; }
+};
+```
+- **关键字段**：`_var_ptrs` 存储变长字段在内存池中的地址（如 `city_region`）。
+
+---
+
+##### 3. **数据操作类（PlanTableDataTuple & Ref）**
+```cpp
+// 数据操作类（用于插入/更新）
+class PlanTableDataTuple {
+    DEFINE_DATA_TUPLE(PlanTableDataTuple, PlanTableS) // 生成基础方法
+    DEFINE_DATA_TUPLE_MEMBER(uint32_t, plan_id);      // 标量字段
+    DEFINE_DATA_TUPLE_MEMBER(uint64_t, region);
+    DEFINE_DATA_TUPLE_VECTOR_MEMBER(uint32_t, city_region, 128); // 变长向量字段
+    // ... 其他方法
+};
+
+// 数据引用类（用于查询）
+class PlanTableDataTupleRef {
+    DEFINE_DATA_TUPLE_REF(PlanTableDataTupleRef, PlanTableS) // 生成引用结构
+    DEFINE_DATA_TUPLE_REF_MEMBER(uint32_t, plan_id);
+    DEFINE_DATA_TUPLE_REF_MEMBER(uint64_t, region);
+    DECLARE_DATA_TUPLE_REF_VECTOR_MEMBER(uint32_t, city_region, 128); // 延迟加载变长字段
+};
+```
+- **差异**：`DataTuple` 用于写操作（含 `set_xxx` 方法），`DataTupleRef` 用于读操作（含延迟加载逻辑）。
+
+---
+
+#### 二、核心方法实现
+
+##### 1. **数据验证（is_valid_data_tuple）**
+```cpp
+bool PlanTableS::is_valid_data_tuple(const TDataTuple &tuple) {
+    if (!tuple.is_set_plan_id()) return false; // 必须字段检查
+    if (!tuple.is_set_region()) return false;
+    if (!tuple.is_set_city_region()) return false;
+    return true;
+}
+```
+- **作用**：确保插入数据包含所有必填字段。
+
+---
+
+##### 2. **数据转换（make_inner_tuple & make_data_tuple）**
+```cpp
+void PlanTableS::make_inner_tuple(const TDataTuple &tuple, TInnerTuple* inner) {
+    inner->plan_id = tuple.plan_id();   // 标量字段直接拷贝
+    inner->region = tuple.region();
+}
+
+void PlanTableS::make_data_tuple(const PlanTableDataTupleRef& ref, TDataTuple* tuple) {
+    tuple->set_plan_id(ref.plan_id());  // 从引用恢复数据
+    tuple->set_region(ref.region());
+    tuple->set_city_region(ref.city_region());
+}
+```
+- **用途**：在内存结构（`InnerTuple`）和业务结构（`DataTuple`）间转换。
+
+---
+
+##### 3. **变长字段存储（insert_var_pools）**
+```cpp
+int PlanTable::insert_var_pools(TInnerTuple &inner, const TDataTuple &tuple) {
+    // 将 city_region 写入内存池，记录虚拟地址
+    int ret = tuple.city_region().save(*_p_var_pools[CITY_REGION], &inner._var_ptrs[CITY_REGION]);
+    if (ret < 0) {
+        CFATAL_LOG("Insert city_region failed.");
+        return -1;
+    }
+    return 0;
+}
+```
+- **流程**：调用 `VectorVar::save()` 将变长字段序列化到内存池，保存返回的虚拟地址。
+
+---
+
+##### 4. **内存池初始化（do_create_inner_pool）**
+```cpp
+int PlanTable::do_create_inner_pool(TInnerPool* p_inner_pool) {
+    static const uint32_t slabs[] = {5, 8, 13, ..., 65537}; // 预定义内存块大小
+    return p_inner_pool->create(slabs, sizeof(slabs)/sizeof(uint32_t), 128*1024);
+}
+```
+- **作用**：配置 Slab 内存池，预分配不同尺寸的块，优化内存分配效率。
+
+---
+
+#### 三、关键调用展开
+
+##### 1. **宏展开示例（DEFINE_DATA_TUPLE_MEMBER）**
+```cpp
+// 宏定义
+#define DEFINE_DATA_TUPLE_MEMBER(type, field_name) \
+    public: \
+        type const& field_name() const { \
+            if (!_is_set_##field_name) { CFATAL_LOG(...); } \
+            return _##field_name; \
+        } \
+        void set_##field_name(type const& value) { \
+            _##field_name = value; _is_set_##field_name = true; \
+        } \
+    private: \
+        type _##field_name; \
+        bool _is_set_##field_name;
+
+// 展开后（以 plan_id 为例）
+public:
+    uint32_t const& plan_id() const {
+        if (!_is_set_plan_id) { /* 错误处理 */ }
+        return _plan_id;
+    }
+    void set_plan_id(uint32_t const& value) {
+        _plan_id = value; _is_set_plan_id = true;
+    }
+private:
+    uint32_t _plan_id;
+    bool _is_set_plan_id;
+```
+
+##### 2. **变长字段访问（city_region）**
+```cpp
+// DataTupleRef 中访问 city_region
+const VectorVar<uint32_t, 128>& city_region() const {
+    // 从内存池加载数据
+    _city_region.load(*_p_var_pools[PlanTable::CITY_REGION], _var_ptrs[CITY_REGION]);
+    return _city_region;
+}
+```
+- **延迟加载**：仅在访问 `city_region` 时从内存池读取数据，减少不必要的内存占用。
+
+---
+
+#### 四、使用示例
+
+##### 1. **插入数据**
+```cpp
+PlanTableDataTuple tuple;
+tuple.set_plan_id(1001);
+tuple.set_region(0x12345678);
+tuple.set_city_region(Vector<uint32_t, 128>{1, 2, 3});
+
+PlanTable plan_table("plan");
+plan_table.create(/* params */);
+plan_table.insert(tuple); // 触发 insert_var_pools
+```
+
+##### 2. **查询数据**
+```cpp
+auto iter = plan_table.seek(1001); // 主键查找
+if (!iter.is_null()) {
+    const auto& ref = *iter;
+    cout << "City Regions: " << ref.city_region() << endl; // 延迟加载
+}
+```
+
+##### 3. **内存回收**
+```cpp
+plan_table.recycle(); // 调用 DataPool::recycle() 批量释放标记内存
+```
+
+---
+
+#### 五、设计总结
+
+- **内存管理**：通过 `DataPool` 和 `SlabMempool32` 实现高效内存分配，减少碎片。
+- **数据抽象**：使用宏生成数据类，分离读写接口（`DataTuple` vs `DataTupleRef`）。
+- **变长字段**：通过 `VectorVar` 和独立内存池管理，支持动态扩容。
+- **性能优化**：延迟加载、批量回收机制提升高频操作性能。
