@@ -1461,3 +1461,167 @@ int element = vec[0];
 
 ### 4. 总结
 `VectorVar` 类通过继承 `VarField` 类，利用 `VectorVarS` 类作为模式定义，实现了可变长度向量数据的加载、保存和访问功能。其调用链涉及到多个类的方法调用，通过模板类的设计，使得代码具有良好的可扩展性和复用性。
+
+以下是针对 `VectorVar` 类的源码级分析及调用链展开：
+
+---
+
+### **1. 类结构与继承关系**
+```cpp
+template <typename T, int MAX_SIZE>
+class VectorVar : public VarField<VectorVarS<T, MAX_SIZE> > {
+public:
+    typedef VarField<VectorVarS<T, MAX_SIZE> > TBase;
+    // ...
+};
+```
+- **继承自** `VarField<VectorVarS<T, MAX_SIZE>>`，使用 `VectorVarS` 作为 `TSchema` 模板参数。
+- **目的**：通过模板特化，将 `Vector<T, MAX_SIZE>` 序列化为可变长度字段（`VarField`）。
+
+---
+
+### **2. `VectorVarS` 模板结构**
+```cpp
+template <typename T, int MAX_SIZE>
+class VectorVarS {
+public:
+    typedef uint16_t THead;
+    typedef uint16_t TTail;
+
+    static void make_var_field(...);
+    static bool check(...);
+    static uint32_t body_size(...);
+};
+```
+- **职责**：定义 `VarField` 所需的元数据操作规则。
+- **关键方法**：
+  - **`make_var_field`**：将 `Vector` 转换为 `VarField` 需要的头、尾和缓冲区。
+  - **`check`**：验证头尾一致性。
+  - **`body_size`**：根据头部计算数据体大小。
+
+---
+
+### **3. 调用链解析**
+
+#### **3.1 数据加载（`load`）**
+```cpp
+VectorVar<T, MAX_SIZE> vec;
+vec.load(src_vector);
+```
+1. **调用 `VarField::load`**：
+    ```cpp
+    template <typename T>
+    void load(const T& src_data) {
+        TSchema::make_var_field(src_data, &_head, &_tail, &_p_body);
+        _is_valid = TSchema::check(_head, _tail);
+    }
+    ```
+2. **`VectorVarS::make_var_field`**：
+    ```cpp
+    static void make_var_field(
+        const Vector<T, MAX_SIZE>& src_data,
+        THead* p_head,
+        TTail* p_tail,
+        const char** p_buf) 
+    {
+        *p_head = src_data.size();     // 头记录元素数量
+        *p_tail = src_data.size();     // 尾同样记录数量（校验用）
+        *p_buf = src_data.raw_buf();   // 获取原始数据指针
+    }
+    ```
+3. **`VectorVarS::check`**：
+    ```cpp
+    static bool check(const THead& head, const TTail& tail) {
+        return (head == tail && head <= MAX_SIZE); // 校验头尾一致且未越界
+    }
+    ```
+
+---
+
+#### **3.2 数据保存（`save`）**
+```cpp
+vec.save(pool, &vaddr);
+```
+1. **调用 `VarField::save`**：
+    ```cpp
+    int save(TPool& pool, typename TPool::TVaddr* p_vaddr) const {
+        // 分配内存并写入头、体、尾
+        uint32_t malloc_size = sizeof(_head) + body_size + sizeof(_tail);
+        typename TPool::TVaddr vaddr = pool.malloc(malloc_size);
+
+        Buffer data[3];
+        data[0].set_buffer(_head);              // 头
+        data[1].set_buffer(_p_body, body_size); // 数据体
+        data[2].set_buffer(_tail);              // 尾
+
+        pool.writev(vaddr, data, 3);            // 批量写入
+    }
+    ```
+2. **`Buffer::set_buffer`**：
+    ```cpp
+    template <typename TObj>
+    void set_buffer(const TObj& obj) {
+        _start = (const char*)&obj;  // 对象地址转为字符指针
+        _size = sizeof(obj);         // 对象大小
+    }
+    ```
+
+---
+
+#### **3.3 数据访问（`operator[]`）**
+```cpp
+const T& element = vec[2];
+```
+1. **调用 `VectorVar::operator[]`**：
+    ```cpp
+    const T& operator[](uint32_t k) const {
+        const char* raw_buf = TBase::body();  // 获取数据体指针
+        uint16_t size = TBase::head();        // 获取实际元素数量
+        const T* buf = (const T*) raw_buf;    // 转换为元素类型指针
+        return buf[k];                        // 返回第k个元素
+    }
+    ```
+2. **`VarField::body()`**：
+    ```cpp
+    const char* body() const { return _p_body; } // 返回数据体指针
+    ```
+
+---
+
+### **4. 内存布局**
+序列化后的内存结构如下：
+```
+| THead (2B) | T data[...] (body_size B) | TTail (2B) |
+```
+- **Head**：记录元素数量（`uint16_t`）。
+- **Body**：实际数据体，大小为 `head * sizeof(T)`。
+- **Tail**：与 Head 相同，用于校验数据完整性。
+
+---
+
+### **5. 关键设计点**
+1. **可变长度字段**：通过 `VarField` 统一管理头、体、尾，支持动态调整数据大小。
+2. **类型安全**：通过模板参数 `T` 和 `MAX_SIZE` 约束数据类型和最大容量。
+3. **校验机制**：头尾双重校验防止数据损坏。
+4. **内存池集成**：通过 `TPool` 抽象实现内存分配与释放的分离。
+
+---
+
+### **6. 示例调用链**
+```
+用户代码：vec.load(src_vector)
+    → VarField::load() 
+        → VectorVarS::make_var_field() 提取头、尾、数据体
+        → VectorVarS::check() 校验头尾
+用户代码：vec.save(pool, &vaddr)
+    → VarField::save()
+        → VectorVarS::body_size() 计算数据体大小
+        → Buffer::set_buffer() 封装头、体、尾为 Buffer 数组
+        → TPool::writev() 批量写入内存池
+用户代码：vec[2]
+    → VectorVar::operator[] 
+        → VarField::body() 获取数据体指针
+        → 强制转换为 T* 后访问元素
+```
+
+通过此设计，`VectorVar` 实现了高效的类型安全可变长度向量存储。
