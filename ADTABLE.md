@@ -512,3 +512,171 @@ MemDataTable<TSchema>::seek(TPrimaryKey const& pk) const {
 
 #### 八、总结
 `MemDataTable` 通过分层内存管理、哈希表优化和变长字段处理，实现了高效的内存型广告数据存储。其优势在于内存池技术减少了内存碎片，链地址法处理哈希冲突保证了性能，变长字段独立存储提高了扩展性，预分配和批量操作提升了性能，适用于大规模广告数据的实时查询和更新场景。 
+
+
+SlabMempool32的存储结构深度解析如下：
+
+1. **核心数据结构**
+```cpp
+struct mem_block_t {
+    char*       start;          // 内存块起始地址
+    uint32_t    item_size;      // 每个数据项的大小
+    uint32_t    free_item;      // 当前可分配项的下标（类似游标）
+    uint32_t    max_item_num;   // 本块最大可容纳项数
+};
+
+struct mem_slab_t {
+    std::vector<uint32_t> block_list;  // 本Slab关联的内存块索引列表
+    uint32_t free_list;                // 空闲链表头节点虚拟地址
+};
+```
+
+2. **地址空间划分**
+```cpp
+// 32位虚拟地址布局：
+// |<----- block_idx (22bit) ----->|<----- offset (10bit) ----->|
+// 通过_idx1_bits和_idx2_bits动态划分：
+const static uint32_t MIN_IDX2_BITS = 10;  // 最小偏移位宽
+const static uint32_t MAX_IDX2_BITS = 20;  // 最大偏移位宽
+uint32_t _idx1_bits;  // 块索引位宽 = 32 - _idx2_bits
+uint32_t _idx2_bits;  // 块内偏移位宽
+uint32_t _idx2_mask;  // 偏移掩码 (1<<_idx2_bits)-1
+
+// 地址构造示例：
+uint32_t make_vaddr(uint32_t block_idx, uint32_t offset) {
+    return (block_idx << _idx2_bits) | offset; 
+}
+```
+
+3. **层级存储结构**
+```cpp
+class SlabMempool32 {
+private:
+    std::vector<uint32_t> _slab_lens;  // 所有Slab规格（如4,8,16,...字节）
+    std::vector<mem_slab_t> _slabs;    // 每个元素对应一个Slab
+    std::vector<mem_block_t> _blocks;  // 所有分配的内存块
+    
+    // 典型内存布局：
+    // Slab[0] (4字节)
+    //   |- Block[0] [4B*1M项] 
+    //   |- Block[1] [4B*1M项]
+    // Slab[1] (8字节)
+    //   |- Block[2] [8B*512K项]
+    // ...
+};
+```
+
+4. **分配过程**
+```cpp
+TVaddr malloc(size_t len) {
+    // 1. 找到最小满足长度的Slab
+    int slab_idx = find_slab(len); 
+    // 2. 优先从空闲链表分配
+    if (slab.free_list != NULL_VADDR) {
+        return malloc_from_freelist(slab);
+    }
+    // 3. 从已有块分配
+    if (block.free_item < block.max_item_num) {
+        return make_vaddr(block_idx, block.free_item++);
+    }
+    // 4. 分配新块
+    return malloc_from_new_block(slab, item_size);
+}
+```
+
+5. **内存块结构**
+```cpp
+// 内存块物理结构示例（item_size=32字节，max_item_num=3）：
+// +----------------+----------------+----------------+
+// | 数据项0 (32B)  | 数据项1 (32B)  | 数据项2 (32B)  |
+// +----------------+----------------+----------------+
+// free_item游标指向下一个可用位置
+
+// 新块初始化时：
+// block.start = new char[item_size * max_item_num];
+// block.free_item = 1; // 第一个项（索引0）立即分配
+```
+
+6. **空闲链表管理**
+```cpp
+// 空闲项链表结构（使用数据项自身存储指针）：
+// +--------+    +--------+    +--------+
+// | next   | -> | next   | -> | NULL   |
+// +--------+    +--------+    +--------+
+// 虚拟地址      虚拟地址      虚拟地址
+
+int push_into_freelist(mem_slab_t& slab, uint32_t vaddr) {
+    uint32_t* addr = (uint32_t*)mem_address(vaddr);
+    *addr = slab.free_list;  // 将当前节点插入链表头
+    slab.free_list = vaddr;
+}
+```
+
+7. **地址转换细节**
+```cpp
+void* mem_address(const TVaddr& vaddr) const {
+    uint32_t block_idx = vaddr >> _idx2_bits;
+    uint32_t offset = vaddr & _idx2_mask;
+    
+    const mem_block_t& block = _blocks[block_idx];
+    return block.start + offset * block.item_size; 
+    // 示例：block_idx=5, offset=3, item_size=32
+    // 物理地址 = blocks[5].start + 3*32
+}
+```
+
+8. **监控指标**
+```cpp
+void monitor(bsl::var::Dict& dict) const {
+    // 关键指标：
+    dict["NODE_NUM"]          // 已分配节点总数
+    dict["USED_BLOCK_NUM"]    // 使用的内存块数
+    dict["MEM_CONSUME"]       // 总内存消耗（含管理结构）
+    dict["ACTUAL_MEM_NEED"]   // 用户实际需要的内存
+    dict["ACTUAL_MEM_USED"]   // 用户实际使用的内存（含内部碎片）
+}
+```
+
+9. **性能优化设计**
+```cpp
+// 位分割优化：通过移位快速分割地址
+inline void split_vaddr(const TVaddr& vaddr, uint32_t& block_idx, uint32_t& offset) {
+    block_idx = vaddr >> _idx2_bits;  // 无分支快速计算
+    offset = vaddr & _idx2_mask;
+}
+
+// 防御性检查：仅在调试模式开启
+#if DEBUG
+    if (block_idx >= _blocks.size()) {
+        CFATAL_LOG("Invalid block index");
+    }
+#endif
+```
+
+10. **扩容策略**
+```cpp
+// 动态块扩容：
+uint32_t malloc_from_new_block(mem_slab_t& slab, uint32_t item_size) {
+    // 计算新块大小（不超过100MB）
+    uint64_t n_bytes = static_cast<uint64_t>(item_size) * 
+                      std::min(MAX_BLOCK_SIZE/item_size, _max_block_item_num);
+    
+    // 分配并初始化新块
+    mem_block_t new_block;
+    new_block.start = new char[n_bytes];
+    new_block.item_size = item_size;
+    new_block.free_item = 1; // 立即分配0号项
+    
+    _blocks.push_back(new_block);
+    slab.block_list.push_back(_blocks.size()-1);
+}
+```
+
+该设计通过分层内存管理、位操作地址转换、空闲链表优化等技术，实现了：
+- O(1)时间复杂度分配/释放
+- 极低的内存碎片率
+- 高效的内存复用
+- 精确的内存监控
+- 动态扩容能力
+
+特别适合广告系统等需要高频分配小对象、对内存效率要求极高的场景。
