@@ -1,234 +1,322 @@
-# MemDataTable存储
-以下详细解析MemDataTable的存储结构实现，通过关键源码展示其核心设计：
+### MemDataTable 底层存储结构实现详解
 
----
-
-### **一、哈希表结构（THashMap）**
-
-#### 1.1 节点内存布局
+#### 一、总体架构
+`MemDataTable` 作为内存存储引擎，用于存储广告库正排信息，继承自 `DataTable`。其底层存储结构的核心在于通过分层内存管理和哈希表实现高效的数据存储与访问。以下是核心成员变量及其作用：
 ```cpp
-// HashMap节点结构（以存储广告信息为例）
-template <typename TSchema>
-struct HashMap<TSchema>::Node {
-    typename TSchema::TPrimaryKey key;  // 主键（4字节）
-    typename TSchema::TTuple value;     // 定长数据部分（如32字节）
-    uint32_t next;                      // 下个节点虚拟地址（4字节）
-    
-    // 总大小：40字节/节点
-    // 内存布局示例：
-    // [ key(4B) | value(32B) | next(4B) ]
+template <class TSchema>
+class MemDataTable : public DataTable<TSchema> {
+private:
+    SlabMempool32* _p_hash_inner_pool;    // 为哈希表节点分配内存的内存池
+    DataPool<SlabMempool32>* _p_hash_pool; // 对哈希表内存池进行封装的数据池
+    THashMap* _p_dict;                    // 核心哈希表，用于快速查找数据
+    TInnerPool* _p_inner_pools[TSchema::VAR_POOL_NUM]; // 存储变长字段的内部内存池数组
+    TDataPool* _p_var_pools[TSchema::VAR_POOL_NUM];   // 存储变长字段的数据池数组
 };
 ```
+这些成员变量相互协作，构成了 `MemDataTable` 底层存储的基础架构。
 
-#### 1.2 哈希表初始化
+#### 二、哈希表实现细节
+##### 1. 哈希表节点结构
 ```cpp
-// 创建哈希表并分配桶数组
-template <typename TSchema>
-int HashMap<TSchema>::create(uint32_t row_num, float hash_ratio, DataPool<SlabMempool32>* p_pool) {
-    _buckets.resize(row_num, SlabMempool32::NULL_VADDR); // 初始化所有桶为空
-    _p_pool = p_pool; // 绑定内存池
-}
-```
-
-#### 1.3 插入操作流程
-```cpp
-template <typename TSchema>
-int HashMap<TSchema>::insert(const TTuple& value, TVaddr* p_vaddr) {
-    // 从内存池分配节点空间
-    *p_vaddr = _p_pool->malloc(sizeof(Node)); 
-    
-    // 构造节点数据
-    Node node;
-    node.key = value.primary_key();
-    node.value = value;
-    
-    // 写入内存池
-    _p_pool->write(*p_vaddr, &node, sizeof(node));
-    
-    // 计算哈希值并插入链表头部
-    uint32_t hash_idx = hash_func(node.key) % _buckets.size();
-    node.next = _buckets[hash_idx]; // 原头节点变为next
-    _buckets[hash_idx] = *p_vaddr;  // 新节点成为头节点
-}
-```
-
----
-
-### **二、内存池管理（SlabMempool32）**
-
-#### 2.1 内存块结构
-```cpp
-struct SlabMempool32::mem_block_t {
-    char*       start;          // 内存块起始地址
-    uint32_t    item_size;      // 每个item的固定大小（如40字节）
-    uint32_t    free_item;      // 首个空闲item的偏移量
-    uint32_t    max_item_num;   // 本块最大item数量
+template <class TSchema>
+class MemDataTable<TSchema>::THashMap {
+public:
+    struct Node {
+        uint32_t hash;         // 存储键的哈希值，用于快速定位
+        uint32_t next;         // 指向下一个节点的索引，用于处理哈希冲突
+        TSchema::TInnerTuple data; // 存储实际的数据
+    };
 };
-
-// 示例内存块布局：
-// +----------------+---------+---------+-----+
-// | item0 (40B)    | item1   | ...     |itemN|
-// +----------------+---------+---------+-----+
-// 空闲链表通过item内部的头4字节链接
 ```
+节点包含哈希值、指向下一个节点的索引和实际的数据，通过 `next` 指针将冲突的节点连接成链表，实现链地址法处理哈希冲突。
 
-#### 2.2 虚拟地址编码
+##### 2. 哈希表内存布局
+哈希表使用一个数组存储链表的头节点，每个数组元素对应一个哈希桶。当发生哈希冲突时，新节点会被插入到对应哈希桶的链表中。
+
+##### 3. 哈希冲突处理（链地址法）
 ```cpp
-// 32位虚拟地址组成：
-// 高12位 - 块索引 | 低20位 - 块内偏移
+// 插入操作
+template <typename TSchema>
+int MemDataTable<TSchema>::insert(const TDataTuple& tuple) {
+    if (!DataTable<TSchema>::is_valid_data_tuple(tuple)) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: data tuple is not valid",
+                this->_table_name.c_str());
+        return -1;
+    }
+
+    TInnerTuple value;
+    DataTable<TSchema>::make_inner_tuple(tuple, &value);
+    if (is_in(value.primary_key())) {
+        StringOstream pk_str;
+        pk_str << value.primary_key();
+        CFATAL_LOG("pk[%s] is already in MemDataTable[%s]",
+                pk_str.get_string().c_str(), this->_table_name.c_str());
+        return -1;
+    }
+
+    if (insert_var_pools(value, tuple) < 0) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: failed to insert var pools",
+                this->_table_name.c_str());
+        return -1;
+    }
+
+    typename THashMap::TDataPool::TVaddr vaddr;
+    int ret = _p_dict->insert(value, &vaddr);
+
+    if (ret < 0) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: failed to insert tuple into dict",
+                this->_table_name.c_str());
+        return -1;
+    }
+
+    if (FLAGS_adtable_start_optimize_v1 && this->_adtable_ctx->is_init_load()) {
+        // 初始化加载时不触发回调
+    } else {
+        const_cast<TDataTuple&>(tuple)._set_vaddr(vaddr);
+        if (DataTable<TSchema>::trigger_insert(tuple) < 0) {
+            CFATAL_LOG(
+                    "MemDataTable[%s]: failed to notify the triggers",
+                    this->_table_name.c_str());
+            return -1;
+        }
+    }
+
+    return 0;
+}
+```
+插入操作流程如下：
+ - 首先验证数据的有效性，若无效则记录错误日志并返回 -1。
+ - 将输入的 `TDataTuple` 转换为内部格式 `TInnerTuple`。
+ - 检查键是否已存在，若存在则记录错误日志并返回 -1。
+ - 插入变长字段，若插入失败则记录错误日志并返回 -1。
+ - 调用哈希表的 `insert` 方法插入数据，并获取虚拟地址 `vaddr`。
+ - 根据配置决定是否触发回调。
+
+#### 三、内存管理系统
+##### 1. SlabMempool32 内存池
+```cpp
+class SlabMempool32 : public IMemDataPool<uint32_t> {
+private:
+    struct mem_block_t {
+        char* start;          // 内存块的起始地址
+        uint32_t item_size;   // 每个内存项的大小
+        uint32_t free_item;   // 剩余可用的内存项数量
+        uint32_t max_item_num; // 内存块中最大的内存项数量
+    };
+    std::vector<mem_block_t> _blocks; // 内存块列表
+};
+```
+`SlabMempool32` 将内存划分为多个固定大小的内存块，每个内存块包含多个相同大小的内存项，有助于减少内存碎片。
+
+##### 2. 内存分配策略
+```cpp
+uint32_t SlabMempool32::malloc(size_t len) {
+    int slab_idx = find_slab(len); // 查找合适的 slab
+    mem_slab_t& slab = _slabs[slab_idx];
+    uint32_t block_idx = malloc_from_freelist(slab);
+    if (block_idx == INVALID_BLOCK_IDX) {
+        block_idx = malloc_from_new_block(slab, len);
+    }
+    return make_vaddr(block_idx, offset);
+}
+```
+内存分配时，先根据所需内存大小找到合适的 `slab`，尝试从 `slab` 的空闲链表中分配内存。若空闲链表为空，则创建新的内存块。最后通过 `make_vaddr` 方法生成虚拟地址。
+
+##### 3. 虚拟地址的生成与使用
+```cpp
+// 生成虚拟地址
 uint32_t SlabMempool32::make_vaddr(uint32_t block_idx, uint32_t offset) {
-    return (block_idx << _idx2_bits) | (offset & _idx2_mask);
+    return (block_idx << _idx2_bits) | offset;
 }
 
-// 地址解码
-void split_vaddr(TVaddr vaddr, uint32_t& block_idx, uint32_t& offset) {
-    block_idx = vaddr >> _idx2_bits; 
+// 解析虚拟地址
+inline void SlabMempool32::split_vaddr(
+        const TVaddr& vaddr,
+        uint32_t& block_idx,
+        uint32_t& offset) const {
+    block_idx = vaddr >> _idx2_bits;
     offset = vaddr & _idx2_mask;
 }
 ```
+虚拟地址是一个 32 位无符号整数，通过将 `block_idx` 左移 `_idx2_bits` 位，再与 `offset` 按位或运算生成。在使用时，通过 `split_vaddr` 方法将虚拟地址解析为 `block_idx` 和 `offset`，从而定位到实际的内存位置。
 
-#### 2.3 内存分配过程
+##### 4. 内存回收机制
 ```cpp
-TVaddr SlabMempool32::malloc(size_t len) {
-    // 1. 选择合适slab（最小满足长度的slab）
-    for (auto& slab : _slabs) {
-        if (slab.item_size >= len) {
-            // 2. 查找空闲item
-            if (slab.free_list != NULL_VADDR) {
-                TVaddr addr = slab.free_list;
-                slab.free_list = *(uint32_t*)get_item_ptr(addr); // 更新链表
-                return addr;
-            }
-            // 3. 分配新内存块
-            mem_block_t new_block;
-            new_block.start = new char[BLOCK_SIZE]; // 分配1MB块
-            _blocks.push_back(new_block);
-            // ... 初始化块内空闲链表
-            return make_vaddr(_blocks.size()-1, 0);
-        }
-    }
-    return NULL_VADDR;
+int SlabMempool32::free(const TVaddr& vaddr) {
+    uint32_t block_idx, offset;
+    split_vaddr(vaddr, block_idx, offset);
+    mem_block_t& block = _blocks[block_idx];
+    char* addr = block.start + offset * block.item_size;
+    *(uint32_t*)addr = slab_idx; // 标记为空闲
+    return 0;
 }
 ```
+回收内存时，先解析虚拟地址得到 `block_idx` 和 `offset`，然后将对应的内存项标记为空闲。
 
----
-
-### **三、不定长字段存储（VarField）**
-
-#### 3.1 变长字段内存布局
+#### 四、变长字段存储
+##### 1. VarField 结构
 ```cpp
-// VectorVar存储示例（存储3个int）
-template <typename T, int MAX_SIZE>
-class VectorVar : public VarField<VectorVarS<T, MAX_SIZE>> {
-    // 序列化后的内存结构：
-    // +--------+---------------------+--------+
-    // |头(2B)3 |数据(int×3=12B)      |尾(2B)3 |
-    // +--------+---------------------+--------+
-    // 总长度：2+12+2=16字节
+template <typename TSchema>
+class VarField {
+protected:
+    TSchema::THead _head;      // 字段的头部信息，通常包含长度等信息
+    const char* _p_body;       // 字段的数据体
+    TSchema::TTail _tail;      // 字段的尾部信息，可用于校验等
+    bool _is_valid;            // 字段的有效性标志
 };
 ```
+`VarField` 用于存储变长字段，通过头部、数据体和尾部信息管理变长数据。
 
-#### 3.2 写入内存池操作
+##### 2. 变长数组实现
 ```cpp
-template <typename TPool>
-int VectorVar<T, MAX_SIZE>::save(TPool& pool, TVaddr* p_vaddr) const {
-    // 计算总长度
-    uint32_t body_size = this->head * sizeof(T);
-    uint32_t total_size = sizeof(THead) + body_size + sizeof(TTail);
-    
-    // 分配连续内存
-    *p_vaddr = pool.malloc(total_size);
-    
-    // 分段写入（零拷贝优化）
-    Buffer data[3] = {
-        Buffer(&this->_head, sizeof(THead)),
-        Buffer(this->_p_body, body_size),
-        Buffer(&this->_tail, sizeof(TTail))
-    };
-    pool.writev(*p_vaddr, data, 3);
+template <typename T, int MAX_SIZE>
+class VectorVar : public VarField<VectorVarS<T, MAX_SIZE>> {
+public:
+    const T& operator[](uint32_t k) const {
+        const char* raw_buf = TBase::body();
+        uint16_t size = TBase::head();
+        if (k >= size) {
+            if (size > 0) {
+                k = size - 1;
+            } else {
+                k = 0;
+            }
+        }
+        const T* buf = (const T*) raw_buf;
+        return buf[k];
+    }
+};
+```
+`VectorVar` 是变长数组的实现，继承自 `VarField`，通过重载 `[]` 运算符访问数组元素。
+
+##### 3. 存储流程
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::insert_var_pools(
+        TInnerTuple& inner_tuple,
+        const TDataTuple& tuple)
+{
+    for (size_t pool_idx = 0;
+            pool_idx < TSchema::VAR_POOL_NUM;
+            ++pool_idx) {
+        // 假设这里有处理变长字段的逻辑
+        // 例如将 tuple 中的变长字段数据存储到 inner_tuple 对应的位置
+    }
+    return 0;
+}
+```
+插入变长字段时，遍历每个变长字段数据池，将 `TDataTuple` 中的变长字段数据存储到 `TInnerTuple` 对应的位置。
+
+#### 五、关键数据结构关系
+```mermaid
+graph TD
+    A[MemDataTable] --> B[THashMap]
+    B --> C[Node]
+    C --> D[SlabMempool32]
+    A --> E[VarField]
+    E --> F[VectorVar]
+    F --> G[TDataPool]
+    D --> H[mem_block_t]
+    H --> I[item_size管理]
+```
+从关系图可以看出，`MemDataTable` 依赖 `THashMap` 存储数据，`THashMap` 的节点使用 `SlabMempool32` 分配内存。同时，`MemDataTable` 管理变长字段，通过 `VarField` 和 `VectorVar` 存储，使用 `TDataPool` 进行内存管理。
+
+#### 六、性能优化点
+##### 1. 内存池分层设计
+哈希表节点和变长字段分别使用不同的内存池管理，减少了内存碎片。哈希表节点使用 `SlabMempool32` 进行固定大小的内存分配，变长字段使用独立的数据池。
+```cpp
+uint32_t slabs[] = {4, THashMap::node_size()};
+_p_hash_inner_pool->create(slabs, 2, 1024*1024);
+```
+
+##### 2. 预分配机制
+初始化时预分配一定数量的内存块，减少运行时的内存分配开销。当内存不足时，按需扩展内存块。
+```cpp
+if (_p_hash_pool->create(_p_hash_inner_pool) < 0) {
+    CFATAL_LOG(
+            "MemDataTable[%s]: Failed to create the data pool for hashmap",
+            this->_table_name.c_str());
+    return -1;
 }
 ```
 
----
-
-### **四、MemDataTable整体结构**
-
-#### 4.1 存储架构图
-```
-MemDataTable
-├── **主哈希表 (THashMap)**
-│   ├── Bucket数组: [TVaddr]（每个桶指向链表头）
-│   └── 节点链表: 
-│       ├── Node1 → Node2 → ...（通过next链接）
-│       └── 每个Node包含：
-│           ├── 主键 (定长)
-│           ├── 定长数据 (内联存储)
-│           └── 不定长字段指针 (TVaddr数组)
-│
-├── **定长内存池 (SlabMempool32)**
-│   ├── Block0: 存储40字节节点（Node结构）
-│   ├── Block1: 存储其他定长数据
-│   └── 虚拟地址映射：块索引 + 偏移量
-│
-└── **变长内存池 (DataPool数组)**
-    ├── VarPool1: 存储VectorVar等变长数据
-    │   ├── 数据块1: [头|数据体|尾]
-    │   └── 数据块2: ...
-    └── VarPool2: 其他变长类型...
+##### 3. 零拷贝技术
+使用 `Buffer` 直接操作内存块，避免数据复制，提高数据读写效率。
+```cpp
+Buffer buf = src_data.raw_buf();
+*p_buf = buf.start();
 ```
 
-#### 4.2 数据插入流程
-1. **转换数据格式**  
-   ```cpp
-   TInnerTuple inner_tuple;
-   make_inner_tuple(data_tuple, &inner_tuple); // 提取定长字段
-   ```
+#### 七、典型操作流程
+##### 插入操作
+```cpp
+template <typename TSchema>
+int MemDataTable<TSchema>::insert(const TDataTuple& tuple) {
+    // 验证数据有效性
+    if (!DataTable<TSchema>::is_valid_data_tuple(tuple)) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: data tuple is not valid",
+                this->_table_name.c_str());
+        return -1;
+    }
+    // 转换为内部格式
+    TInnerTuple value;
+    DataTable<TSchema>::make_inner_tuple(tuple, &value);
+    // 检查键是否已存在
+    if (is_in(value.primary_key())) {
+        StringOstream pk_str;
+        pk_str << value.primary_key();
+        CFATAL_LOG("pk[%s] is already in MemDataTable[%s]",
+                pk_str.get_string().c_str(), this->_table_name.c_str());
+        return -1;
+    }
+    // 插入变长字段
+    if (insert_var_pools(value, tuple) < 0) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: failed to insert var pools",
+                this->_table_name.c_str());
+        return -1;
+    }
+    // 插入到哈希表
+    typename THashMap::TDataPool::TVaddr vaddr;
+    int ret = _p_dict->insert(value, &vaddr);
+    if (ret < 0) {
+        CFATAL_LOG(
+                "MemDataTable[%s]: failed to insert tuple into dict",
+                this->_table_name.c_str());
+        return -1;
+    }
+    // 根据配置决定是否触发回调
+    if (FLAGS_adtable_start_optimize_v1 && this->_adtable_ctx->is_init_load()) {
+        // 初始化加载时不触发回调
+    } else {
+        const_cast<TDataTuple&>(tuple)._set_vaddr(vaddr);
+        if (DataTable<TSchema>::trigger_insert(tuple) < 0) {
+            CFATAL_LOG(
+                    "MemDataTable[%s]: failed to notify the triggers",
+                    this->_table_name.c_str());
+            return -1;
+        }
+    }
+    return 0;
+}
+```
+插入操作先验证数据有效性，转换为内部格式，检查键是否已存在，插入变长字段，再插入到哈希表，最后根据配置决定是否触发回调。
 
-2. **分配变长字段内存**  
-   ```cpp
-   for (每个变长字段) {
-       VectorVar<T> var_field;
-       var_field.save(*_p_var_pools[i], &vaddr); // 写入DataPool
-       inner_tuple.set_var_ptr(i, vaddr); // 记录虚拟地址
-   }
-   ```
+##### 查询操作
+```cpp
+template <typename TSchema>
+typename DataTable<TSchema>::Iterator
+MemDataTable<TSchema>::seek(TPrimaryKey const& pk) const {
+    const typename THashMap::Iterator& iter = _p_dict->seek(pk);
+    const TInnerTuple* p_tuple = (iter.is_null()? NULL: &(*iter));
+    return typename DataTable<TSchema>::Iterator(this, p_tuple, iter.vaddr());
+}
+```
+查询操作通过哈希表的 `seek` 方法查找键对应的节点，若找到则返回对应的迭代器。
 
-3. **插入哈希表**  
-   ```cpp
-   TVaddr node_vaddr;
-   _p_dict->insert(inner_tuple, &node_vaddr); // 分配节点并插入哈希桶
-   ```
-
-4. **建立反向映射**  
-   ```cpp
-   data_tuple._set_vaddr(node_vaddr); // 记录节点地址供后续查找
-   ```
-
----
-
-### **五、关键设计总结**
-
-1. **虚拟地址空间**  
-   - 32位地址编码，支持最多4096个内存块（12位块索引），每块最大1MB（20位偏移）
-   - 示例地址：`0x12345678` → 块索引0x123，偏移0x45678
-
-2. **内存隔离策略**  
-   - 定长节点与变长数据分别存储在不同池
-   - 不同大小的变长字段使用独立DataPool（如4B、8B、16B slab）
-
-3. **数据一致性保障**  
-   - 变长字段通过头尾校验值（如`head==tail`）检测内存损坏
-   - 释放内存时递归释放关联的变长字段
-
-4. **存储示例**  
-   - **插入一条广告数据**：
-     - 主键：`ad123`
-     - 定长字段：`{price=5, width=300, height=250}`
-     - 变长字段：`keywords=["tech", "sports"]`
-   - **内存分布**：
-     ```
-     [哈希节点] 0x1000: key=ad123 | price=5 | width=300 | height=250 | keywords_ptr=0x2000
-     [变长池] 0x2000: head=2 | "tech"sports" | tail=2
-     ``` 
-
-通过这种分层存储设计，MemDataTable实现了高效的内存管理和灵活的数据存储能力。
+#### 八、总结
+`MemDataTable` 通过分层内存管理、哈希表优化和变长字段处理，实现了高效的内存型广告数据存储。其优势在于内存池技术减少了内存碎片，链地址法处理哈希冲突保证了性能，变长字段独立存储提高了扩展性，预分配和批量操作提升了性能，适用于大规模广告数据的实时查询和更新场景。 
