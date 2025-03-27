@@ -514,7 +514,9 @@ MemDataTable<TSchema>::seek(TPrimaryKey const& pk) const {
 `MemDataTable` 通过分层内存管理、哈希表优化和变长字段处理，实现了高效的内存型广告数据存储。其优势在于内存池技术减少了内存碎片，链地址法处理哈希冲突保证了性能，变长字段独立存储提高了扩展性，预分配和批量操作提升了性能，适用于大规模广告数据的实时查询和更新场景。 
 
 
-SlabMempool32的存储结构深度解析如下：
+### SlabMempool32的存储结构深度解析如下：
+内存池的工作流程：
+![image](https://github.com/user-attachments/assets/5c7df6ea-3f98-43d6-8627-14dd4683d6b6)
 
 1. **核心数据结构**
 ```cpp
