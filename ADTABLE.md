@@ -614,6 +614,10 @@ int push_into_freelist(mem_slab_t& slab, uint32_t vaddr) {
 }
 ```
 
+在 push_into_freelist 方法里，不能直接把 slab.free_list 设为 vaddr，这是因为空闲链表需要实现链表节点的连接，进而管理多个空闲内存块。下面为你详细解释为何要处理 addr 以及直接设置 slab.free_list = vaddr 不可行的原因。
+空闲链表的工作原理
+SlabMempool32 借助空闲链表来管理已释放的内存块。空闲链表是一种单链表，其中每个节点代表一个空闲的内存块，每个节点存储着下一个空闲内存块的虚拟地址。通过这种方式，内存池能够迅速找到并分配空闲的内存块。
+
 7. **地址转换细节**
 ```cpp
 void* mem_address(const TVaddr& vaddr) const {
