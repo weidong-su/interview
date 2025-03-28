@@ -1,4 +1,4 @@
-### MemDataTable 底层存储结构实现详解
+## MemDataTable 底层存储结构实现详解
 MemDataTable存储结构深度解析（总分结构）
 
 MemDataTable是广告库核心内存存储引擎，采用多层次复合存储结构。以下从总体结构到各核心组件进行详细分析：
@@ -687,6 +687,7 @@ uint32_t malloc_from_new_block(mem_slab_t& slab, uint32_t item_size) {
 
 特别适合广告系统等需要高频分配小对象、对内存效率要求极高的场景。
 
+# IndexTable/KeyListIndex存储结构
 
 以下是对 ExactIndex 的存储结构、底层实现及涉及组件的详细分析，结合源码进行说明：
 
