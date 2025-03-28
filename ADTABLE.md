@@ -686,3 +686,252 @@ uint32_t malloc_from_new_block(mem_slab_t& slab, uint32_t item_size) {
 - 动态扩容能力
 
 特别适合广告系统等需要高频分配小对象、对内存效率要求极高的场景。
+
+
+以下是对 ExactIndex 的存储结构、底层实现及涉及组件的详细分析，结合源码进行说明：
+
+---
+### 1. 整体架构
+ExactIndex 是基于 KeyListIndex 和 IndexTable 构建的倒排索引系统，采用哈希表+链表结构实现高效查询。其核心架构如下：
+
+```text
++-------------------+       +-----------------+
+|   IndexTable      |       |  KeyListIndex   |
+| (ExactIndex)      |------>| (HashMap结构)    |
++-------------------+       +-----------------+
+       |                          |
+       |                          v
++-------------------+       +-----------------+
+|   DataPool        |       |  LinkList       |
+| (内存池管理)        |<------| (链表存储索引节点) |
++-------------------+       +-----------------+
+```
+
+---
+### 2. 核心组件详解
+
+#### 2.1 IndexTable 模板类
+```cpp
+template <typename TSchema>
+class IndexTable : public IndexTableBase {
+    // 关键成员
+    TDataTable*  _p_data_table; // 关联的数据表
+    TIndex*      _p_index;      // KeyListIndex实例
+    TInnerPool*  _p_inner_pool; // Slab内存池
+    TDataPool*   _p_data_pool;  // 数据池
+};
+```
+**功能**：
+- 作为倒排索引的入口类，管理 KeyListIndex 和内存池
+- 提供索引的插入、删除、查询接口
+- 监控和统计功能
+
+**源码分析**：
+- create() 方法初始化内存池和 KeyListIndex：
+```cpp
+int create(size_t key_num, size_t node_num, size_t key_chunk_size) {
+    create_data_pool();  // 创建SlabMempool32
+    _p_index = new TIndex(name); // 创建KeyListIndex
+    _p_index->create(key_num, hash_ratio, _p_data_pool);
+}
+```
+
+---
+#### 2.2 KeyListIndex 类
+```cpp
+template <typename TSchema>
+class KeyListIndex {
+    THashMap*   _p_index;    // 哈希表结构
+    TDataPool*  _p_pool;     // 数据池
+};
+```
+**功能**：
+- 实现键到链表的映射（Key->List）
+- 处理哈希冲突（链地址法）
+- 管理索引节点的生命周期
+
+**存储结构**：
+```text
+HashMap
++---------+    +----------------+    +----------------+
+| Bucket0 |--->| Key1 -> ListA  |    | ListNode1      |
++---------+    +----------------+    +----------------+
+| Bucket1 |--->| Key2 -> ListB  |--->| ListNode2      |-->...
++---------+    +----------------+    +----------------+
+| ...     |    | ...            |    | ...            |
++---------+    +----------------+    +----------------+
+```
+
+**源码分析**：
+- insert() 方法实现索引插入：
+```cpp
+int insert(const TIndexKey &key, const TIndexTuple &value) {
+    // 通过哈希找到桶
+    uint32_t bucket = hash_entry(key); 
+    
+    // 获取或创建链表
+    TList& list = get_list(bucket, key);
+    
+    // 插入链表节点
+    list.insert(value, true); // true表示需要排序
+}
+```
+
+---
+#### 2.3 LinkList 链表
+```cpp
+template <class T, class TCmp, class TDataPool>
+class LinkList {
+    TVaddr      _p_head;     // 链表头虚拟地址
+    TDataPool*  _p_pool;     // 数据池引用
+};
+```
+**节点结构**：
+```cpp
+class ListNode {
+    TVaddr  _next;  // 下个节点虚拟地址 (4B)
+    char    _p_data[1]; // 实际数据（柔性数组）
+};
+```
+**内存布局**：
+```text
++------------+------------------+
+| 4B next指针 | sizeof(T) 数据区 | 
++------------+------------------+
+```
+
+**关键操作**：
+- 排序插入（通过 TCmp::sort_op 比较）：
+```cpp
+int insert(const T& value, bool need_sort) {
+    if (need_sort) {
+        find_insert_pos(value, prev_node); // 找到插入位置
+        insert_after(value, prev_node);
+    }
+}
+```
+
+---
+#### 2.4 内存管理组件
+
+##### 2.4.1 DataPool
+```cpp
+template <typename TPool>
+class DataPool {
+    TPool*      _p_pool;    // 底层内存池
+    std::vector<TVaddr> _dirty_nodes; // 待回收节点
+};
+```
+**功能**：
+- 封装内存分配/释放操作
+- 内存回收管理
+
+##### 2.4.2 SlabMempool32
+```cpp
+class SlabMempool32 : public IMemDataPool<uint32_t> {
+    std::vector<mem_block_t>   _blocks; // 内存块列表
+    std::vector<mem_slab_t>    _slabs;  // 不同规格的Slab
+};
+```
+**内存分配策略**：
+1. 预定义不同规格的 Slab（如 32B、64B、128B）
+2. 按需分配内存块（每个块包含多个相同大小的对象）
+3. 使用虚拟地址（32位）映射物理内存
+
+**内存布局示例**：
+```text
+Block (1MB)
++------------+------------+-----+
+| Node0 (32B)| Node1 (32B)| ... |
++------------+------------+-----+
+```
+
+---
+### 3. ExactIndex 具体实现
+
+#### 3.1 索引节点定义
+```cpp
+class ExactIndexNode {
+    DEFINE_INDEX_TUPLE_MEMBER(uint64_t, winfo_id)
+    DEFINE_INDEX_TUPLE_MEMBER(typename WinfoTable::TVaddr, vaddr)
+};
+```
+**内存布局**：
+```text
++------------+----------------+----------------+
+| next指针(4B)| winfo_id (8B)  | vaddr (4B)     | 
++------------+----------------+----------------+
+```
+
+#### 3.2 排序规则
+```cpp
+bool ExactIndexS::sort_op(const TIndexTuple& lhs, const TIndexTuple& rhs) {
+    // 通过UDF实现具体排序逻辑
+    return ExactIndexUDF::sort_compare(lhs, rhs);
+}
+```
+**典型场景**：
+- 按 winfo_id 升序排列
+- 支持自定义排序规则
+
+---
+### 4. 关键操作流程
+
+#### 4.1 插入数据
+```text
+1. 用户调用 IndexTable::insert(key, node)
+2. 通过 KeyListIndex 找到对应链表
+3. 分配内存（DataPool->malloc）
+4. 创建新节点并插入链表
+5. 必要时进行链表排序
+```
+
+#### 4.2 查询数据
+```text
+1. 用户调用 IndexTable::seek(key)
+2. 哈希计算找到对应桶
+3. 遍历链表节点
+4. 通过 vaddr 访问实际数据
+```
+
+---
+### 5. 性能优化设计
+
+1. **内存预分配**：
+   - SlabMempool32 预分配不同规格的内存块
+   - 减少内存碎片，提高分配速度
+
+2. **缓存友好设计**：
+   - 链表节点将 next 指针放在结构体头部
+   - 预取下一节点数据（见 LinkList::Iterator::operator++）
+
+3. **批量加载**：
+   ```cpp
+   bool use_batch_load() { return true; } // 启用批量加载优化
+   ```
+
+4. **哈希优化**：
+   - 使用 Uint64Key 的 XOR 哈希算法
+   - 动态调整哈希桶数量
+
+---
+### 6. 监控统计
+通过 monitor() 方法获取运行时状态：
+```cpp
+void monitor(bsl::var::Dict& dict) const {
+    dict["NODE_NUM"] = _node_num;         // 总节点数
+    dict["MEM_CONSUME"] = _mem_consume;   // 内存消耗
+    dict["HASH_RATIO"] = _hash_ratio;     // 哈希负载因子
+}
+```
+
+---
+### 总结
+ExactIndex 通过多层抽象（IndexTable -> KeyListIndex -> LinkList）实现高效倒排索引，配合 Slab 内存池和优化的哈希策略，在内存管理和查询性能上达到平衡。其设计特点包括：
+
+1. 虚拟地址管理实现内存安全访问
+2. 链表排序支持灵活的数据组织
+3. 细粒度内存控制减少碎片
+4. 多级监控统计保障系统可观测性
+
+这种结构特别适合广告系统等需要高效精确查询的场景，能够支持百万级 QPS 的查询需求。
