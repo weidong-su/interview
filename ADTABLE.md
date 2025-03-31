@@ -936,3 +936,177 @@ ExactIndex 通过多层抽象（IndexTable -> KeyListIndex -> LinkList）实现�
 4. 多级监控统计保障系统可观测性
 
 这种结构特别适合广告系统等需要高效精确查询的场景，能够支持百万级 QPS 的查询需求。
+
+# 索引触发
+
+### 触发器（Trigger）机制详解
+
+#### 一、机制概述
+触发器机制用于在数据表发生插入或删除操作时，自动执行关联的索引更新逻辑，确保索引与数据的一致性。该机制通过`ITrigger`接口定义标准操作，由具体触发器（如`DefaultTrigger`或自定义触发器）实现索引维护逻辑。核心流程如下：
+
+1. **数据插入后**：触发器生成索引键和节点，插入索引表。
+2. **数据删除前**：触发器根据数据定位索引条目，从索引表中移除。
+
+#### 二、核心组件解析
+
+##### 1. ITrigger 接口类
+```cpp
+template<typename TDataTuple, typename TVaddr>
+class ITrigger {
+public:
+    virtual int do_after_insert(const TDataTuple& tuple) = 0;
+    virtual int do_before_remove(const typename TDataTuple::RefType& tuple) = 0;
+    //... 其他辅助方法
+};
+```
+- **职责**：定义触发器必须实现的接口。
+- **关键方法**：
+  - `do_after_insert`：插入数据后触发，用于更新索引。
+  - `do_before_remove`：删除数据前触发，用于清理索引。
+- **调用时机**：由数据表在插入/删除操作中显式调用。
+
+##### 2. Trigger 模板基类
+```cpp
+template<typename TSchema>
+class Trigger : public ITrigger</*...*/> {
+protected:
+    TIndexTable* _p_index; // 关联的索引表
+    const THandle* _p_handle; // 处理器，可访问其他表
+public:
+    int create(TIndexTable* p_index, const THandle* p_handle) {
+        // 初始化索引表和处理器
+    }
+    //...
+};
+```
+- **职责**：提供触发器与索引表、处理器的关联管理。
+- **关键成员**：
+  - `_p_index`：指向关联的索引表，用于操作索引数据。
+  - `_p_handle`：处理器对象，可访问其他数据表（如跨表查询）。
+- **create方法**：绑定索引表和处理器，为触发器提供上下文。
+
+##### 3. DefaultTrigger 默认实现
+```cpp
+template<typename TSchema>
+class DefaultTrigger : public Trigger<TSchema> {
+    int do_after_insert(const TDataTuple& tuple) override {
+        TIndexKey key;
+        TIndexNode value;
+        TSchema::make_index_tuple(tuple, &key, &value); // 生成索引键和节点
+        this->_p_index->insert(key, value, true); // 插入索引表
+    }
+    //... do_before_remove类似
+};
+```
+- **职责**：提供默认的索引维护逻辑。
+- **关键流程**：
+  - **插入时**：调用`TSchema::make_index_tuple`生成索引条目，插入索引表。
+  - **删除时**：调用`TSchema::make_index_key`生成索引键，从索引表删除对应条目。
+
+##### 4. 自定义触发器示例：UnitWinfoTrigger
+```cpp
+class UnitWinfoTrigger : public Trigger<UnitWinfoTriggerS> {
+protected:
+    int do_after_insert(const TDataTuple &tuple) override {
+        // 调用UDF处理具体逻辑
+        return UnitWinfoTriggerUDF<UnitWinfoTriggerS>::do_after_insert(/*...*/);
+    }
+    //... do_before_remove类似
+};
+```
+- **职责**：实现业务特定的索引逻辑（如条件索引）。
+- **实现方式**：通过UDF（用户定义函数）封装核心逻辑，提高复用性。
+
+##### 5. 用户定义函数（UDF）
+```cpp
+template <typename TSchema>
+int UnitWinfoTriggerUDF<TSchema>::do_after_insert(
+        TIndexTable* index_table, const TDataTuple& tuple) {
+    if (!tuple.is_unit_bid()) return 0; // 条件判断
+    TIndexKey key;
+    TIndexNode value;
+    TSchema::make_index_tuple(tuple, &key, &value);
+    return index_table->insert(key, value, true); // 条件满足时更新索引
+}
+```
+- **职责**：封装业务条件判断和索引操作。
+- **优势**：解耦触发器与具体逻辑，便于复用和维护。
+
+#### 三、索引表（IndexTable）协作
+```cpp
+template<typename TSchema>
+class IndexTable {
+public:
+    int insert(const TIndexKey &key, const TIndexNode &tuple) {
+        // 实际插入索引逻辑
+    }
+    int remove(const TIndexKey& key, const TVaddr& vaddr) {
+        // 根据虚拟地址删除索引节点
+    }
+};
+```
+- **职责**：维护倒排索引数据，提供增删接口。
+- **关键操作**：
+  - **insert**：插入索引节点，支持排序（如时序索引）。
+  - **remove**：根据数据虚拟地址（vaddr）删除索引节点。
+
+#### 四、流程时序
+
+##### 数据插入流程
+1. **数据表插入**：调用`DataTable::insert()`插入数据。
+2. **触发AfterInsert**：
+   ```cpp
+   // DataTable 内部逻辑
+   for (auto& trigger : triggers) {
+       trigger->notify_after_insert(new_tuple);
+   }
+   ```
+3. **生成索引条目**：触发器调用`TSchema::make_index_tuple`生成键和节点。
+4. **更新索引表**：调用`IndexTable::insert()`插入索引。
+
+##### 数据删除流程
+1. **数据表删除**：调用`DataTable::remove()`删除数据。
+2. **触发BeforeRemove**：
+   ```cpp
+   // DataTable 内部逻辑
+   for (auto& trigger : triggers) {
+       trigger->notify_before_remove(old_tuple_ref);
+   }
+   ```
+3. **定位索引条目**：触发器调用`TSchema::make_index_key`生成键。
+4. **清理索引表**：调用`IndexTable::remove()`删除对应条目。
+
+#### 五、关键设计点
+
+1. **虚拟地址（vaddr）**  
+   数据项在内存池中的唯一地址，用于索引表快速定位数据。索引节点中保存vaddr，形成数据与索引的关联。
+
+2. **条件触发**  
+   自定义触发器可通过业务条件（如`is_unit_bid`）决定是否更新索引，实现部分索引或条件索引。
+
+3. **跨表访问**  
+   通过`THandle`访问其他数据表（如`DemoTables`），支持复杂业务逻辑（如关联更新）。
+
+4. **模板化设计**  
+   通过`TSchema`抽象数据模式，使触发器与具体表解耦，提高复用性。
+
+#### 六、示例场景
+
+以`UnitWinfoTrigger`为例，说明其工作流程：
+
+- **数据插入**  
+  当`WinfoTable`插入一条数据时：
+  1. `UnitWinfoTrigger`的`do_after_insert`被调用。
+  2. UDF检查`is_unit_bid`字段，若为true：
+     - 生成`unit_id`作为索引键。
+     - 插入到`UnitWinfoIndex`索引表中。
+  
+- **数据删除**  
+  当从`WinfoTable`删除数据时：
+  1. `UnitWinfoTrigger`的`do_before_remove`被调用。
+  2. UDF根据`unit_id`生成索引键。
+  3. 从`UnitWinfoIndex`中移除对应vaddr的索引节点。
+
+#### 七、总结
+
+触发器机制通过抽象接口和模板化设计，实现了数据表与索引表的解耦，支持灵活的索引策略。开发者可通过继承`Trigger`并实现UDF，快速定制业务特定的索引逻辑，而默认实现`DefaultTrigger`简化了基础索引的维护。该机制在保证数据一致性的同时，提供了高效的条件索引和跨表操作能力。
