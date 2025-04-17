@@ -62,7 +62,12 @@ Bthread 和 Pthread 是两种不同的并发执行模型，主要区别体现在
 | **适用场景**   | I/O 密集型、高并发         | 计算密集型、低并发        |
 | **负载均衡**   | Work Stealing 全局优化     | 依赖内核调度或线程池策略  |
 
-# 
+# View的理解
+
+1. View只是业务使用的逻辑接口，作用是为了数据隔离，推导node执行顺序（DAG图），底层是Msg*, 而框架Dataflow都是基于MsgGroup(Msg**)
+2. 比如mtserver模块只有一个Msg(TD)，node间的数据流转也只有TD，至于Msg* => MsgGroup，底层processor在执行完业务process后 会完成这个动作，push到MsgGroup
+
+   
 在提供的流式计算框架中，`In<View1>`和`Out<View2>`的转换过程通过以下机制实现：
 
 ### 一、类型注册与消息标识
