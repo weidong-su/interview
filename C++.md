@@ -1,3 +1,165 @@
+# C++实现线程池
+
+
+以下是对简化版线程池代码的逐行解释：
+
+---
+
+### 头文件部分
+```cpp
+#include <vector>   // 存储工作线程的容器
+#include <queue>    // 任务队列数据结构
+#include <thread>   // 线程管理
+#include <mutex>    // 互斥锁（互斥量）
+#include <condition_variable> // 条件变量
+```
+
+---
+
+### 类定义部分
+```cpp
+class SimpleThreadPool {
+public:
+    explicit SimpleThreadPool(size_t num_threads) {  // 构造函数
+        for (size_t i = 0; i < num_threads; ++i) {   // 创建指定数量的工作线程
+            workers.emplace_back([this] {             // 每个线程执行lambda表达式
+                while (true) {                       // 无限循环等待任务
+                    std::function<void()> task;       // 任务容器
+                    {                                 // 进入临界区
+                        std::unique_lock<std::mutex> lock(queue_mutex); // 自动加锁
+                        condition.wait(lock, [this] { // 条件变量等待（自动解锁）
+                            return !tasks.empty() || stop; // 唤醒条件：有任务或停止标志
+                        });
+                        
+                        if (stop && tasks.empty()) return; // 终止条件：停止且队列空
+                        
+                        task = std::move(tasks.front());   // 移动语义获取任务
+                        tasks.pop();                       // 从队列移除
+                    }                                     // 自动解锁
+                    task();                               // 执行任务（在锁外）
+                }
+            });
+        }
+    }
+
+    template<typename F>
+    void addTask(F&& task) {                           // 添加任务的模板方法
+        {                                              
+            std::unique_lock<std::mutex> lock(queue_mutex); // 加锁
+            tasks.emplace(std::forward<F>(task));      // 完美转发任务到队列
+        }                                               // 自动解锁
+        condition.notify_one();                         // 通知一个等待线程
+    }
+
+    ~SimpleThreadPool() {                               // 析构函数
+        {                                               // 临界区开始
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;                                // 设置停止标志
+        }                                               // 自动解锁
+        condition.notify_all();                        // 唤醒所有线程
+        for (auto& worker : workers) {                  // 等待所有线程结束
+            worker.join();
+        }
+    }
+
+private:
+    std::vector<std::thread> workers;   // 工作线程容器
+    std::queue<std::function<void()>> tasks; // 任务队列（存储void()可调用对象）
+    
+    std::mutex queue_mutex;            // 保护任务队列的互斥锁
+    std::condition_variable condition; // 线程间通信的条件变量
+    bool stop = false;                 // 停止标志（原子操作简化版）
+};
+```
+
+---
+
+### 关键执行流程解析
+1. **线程创建阶段**（构造函数）：
+   ```cpp
+   workers.emplace_back([this] { ... });
+   ```
+   - 创建`num_threads`个工作线程
+   - 每个线程进入无限任务循环
+
+2. **任务获取逻辑**：
+   ```cpp
+   condition.wait(lock, [this]{ return !tasks.empty() || stop; });
+   ```
+   - 线程休眠直到满足以下条件之一：
+     - 任务队列非空
+     - 停止标志被设置
+   - 避免虚假唤醒（spurious wakeup）
+
+3. **任务执行阶段**：
+   ```cpp
+   task = std::move(tasks.front());  // 移动而非拷贝任务
+   tasks.pop();                      // 移除队列头部
+   task();                           // 在锁外执行任务
+   ```
+   - 使用移动语义提高效率
+   - 任务执行不在锁保护范围内，允许并发执行
+
+4. **任务添加逻辑**：
+   ```cpp
+   tasks.emplace(std::forward<F>(task)); // 完美转发
+   condition.notify_one();              // 唤醒一个线程
+   ```
+   - 支持任意可调用对象（lambda、函数指针等）
+   - 通知单个空闲线程处理新任务
+
+5. **安全关闭机制**（析构函数）：
+   ```cpp
+   stop = true;                       // 设置停止标志
+   condition.notify_all();            // 唤醒所有线程
+   for (auto& worker : workers) {     // 等待线程结束
+       worker.join();
+   }
+   ```
+   - 保证所有已入队任务被执行完
+   - 防止线程在任务执行中途被终止
+
+---
+
+### 重要设计特点
+1. **RAII锁管理**：
+   - 使用`std::unique_lock`自动管理锁生命周期
+   - 保证即使发生异常也能正确释放锁
+
+2. **条件变量使用**：
+   ```cpp
+   condition.wait(lock, predicate);
+   ```
+   - 等效于：
+     ```cpp
+     while(!predicate()) {
+         condition.wait(lock);
+     }
+     ```
+   - 防止虚假唤醒
+
+3. **任务转发优化**：
+   ```cpp
+   std::forward<F>(task)  // 完美转发保持值类别
+   tasks.emplace(...)     // 避免不必要的拷贝
+   ```
+
+4. **线程安全退出**：
+   ```cpp
+   if (stop && tasks.empty()) return; // 终止条件检查
+   ```
+   - 确保队列清空后才结束线程
+
+---
+
+这个简化版本保留了线程池最核心的：
+- 线程复用
+- 任务队列管理
+- 线程间同步
+- 优雅关闭机制
+
+适合作为理解多线程编程的基础模板，可根据需要扩展返回值处理、优先级队列等功能。
+
 # 说一说你了解的关于lambda函数的全部知识
 > https://c.biancheng.net/view/3741.html
 
